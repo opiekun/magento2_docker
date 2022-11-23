@@ -1,0 +1,87 @@
+version: "3.5"
+
+services:
+
+  mg121ecommerce:
+    container_name: mg2.test__mg121ecommerce
+    image: zerocool78/mg2:home
+    ports:
+      - "127.0.0.1:33060:22/tcp"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mg121ecommerce-mg2.tls=true
+      - traefik.http.routers.mg121ecommerce-mg2.entryPoints=https
+      - traefik.http.routers.mg121ecommerce-mg2.rule=Host(`mg121ecommerce.mg2.test`)
+      - traefik.http.services.mg121ecommerce-mg2.loadbalancer.server.port=8080
+    restart: always
+
+  traefik:
+    container_name: mg2.test__traefik
+    image: traefik:2.2
+    command:
+      - --api
+      - --docker
+      - --docker.domain=test
+      - --docker.network=mg2
+      - --docker.exposedByDefault=false
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    volumes:
+      - ~/.mg2/traefik/traefik.toml:/etc/traefik/traefik.toml:ro
+      - ~/.mg2/traefik/dynamic.toml:/etc/traefik/dynamic.toml:ro
+      - ~/.mg2/ssl/certs/mg2.crt:/etc/ssl/certs/mg2.crt:ro
+      - ~/.mg2/ssl/private/mg2.key:/etc/ssl/private/mg2.key:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.traefik-mg2.tls=true
+      - traefik.http.routers.traefik-mg2.entryPoints=https
+      - traefik.http.routers.traefik-mg2.service=api@internal
+      - traefik.http.routers.traefik-mg2.rule=Host(`traefik.mg2.test`)
+      - traefik.http.services.api.loadbalancer.server.port=8080
+    restart: always
+
+  dnsmasq:
+    container_name: mg2.test__dnsmasq
+    image: zerocool78/mg2:dnsmasq
+    ports:
+      - "127.0.0.1:53:53/udp"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dnsmasq-mg2.tls=true
+      - traefik.http.routers.dnsmasq-mg2.entryPoints=https
+      - traefik.http.routers.dnsmasq-mg2.rule=Host(`dnsmasq.mg2.test`)
+      - traefik.http.services.dnsmasq-mg2.loadbalancer.server.port=8080
+    restart: always
+
+
+  portainer:
+    container_name: mg2.test__portainer
+    image: portainer/portainer:1.24.0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.portainer-mg2.tls=true
+      - traefik.http.routers.portainer-mg2.entryPoints=https
+      - traefik.http.routers.portainer-mg2.rule=Host(`portainer.mg2.test`)
+      - traefik.http.services.portainer-mg2.loadbalancer.server.port=9000
+    restart: always
+
+  mailhog:
+    container_name: mg2.test__mailhog
+    image: mailhog/mailhog:v1.0.0
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mailhog-mg2.tls=true
+      - traefik.http.routers.mailhog-mg2.entryPoints=https
+      - traefik.http.routers.mailhog-mg2.rule=Host(`mailhog.mg2.test`)
+      - traefik.http.services.mailhog-mg2.loadbalancer.server.port=8025
+    restart: always
+volumes:
+  portainer:
+networks:
+  default:
+    name: mg2

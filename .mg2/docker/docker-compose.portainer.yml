@@ -1,0 +1,20 @@
+version: "3.5"
+
+services:
+
+  portainer:
+    container_name: mg2.test__portainer
+    image: portainer/portainer:${MG2_GLOBAL_PORTAINER}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.portainer-mg2.tls=true
+      - traefik.http.routers.portainer-mg2.entryPoints=https
+      - traefik.http.routers.portainer-mg2.rule=Host(`portainer.mg2.test`)
+      - traefik.http.services.portainer-mg2.loadbalancer.server.port=9000
+    restart: ${MG2_GLOBAL_SERVICES_AUTO_START}
+
+volumes:
+  portainer:

@@ -1,0 +1,14 @@
+#!/bin/bash
+
+sed -n '/^__ARCHIVED__/q;p' ./.mg2/bin/mg2 > ./mg2
+
+echo '
+
+exit 0
+
+__ARCHIVED__' >> ./mg2
+
+tar --format ustar -czf ./mg2.tar.gz .mg2
+cat ./mg2.tar.gz >> ./mg2
+
+rm -rf mg2.tar.gz

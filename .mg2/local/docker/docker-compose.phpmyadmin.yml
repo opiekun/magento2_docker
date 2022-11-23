@@ -1,0 +1,29 @@
+version: "3.5"
+
+services:
+
+  phpmyadmin:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__phpmyadmin
+    image: phpmyadmin/phpmyadmin
+    depends_on:
+      - db
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.phpmyadmin-${COMPOSE_PROJECT_NAME}.tls=true
+      - traefik.http.routers.phpmyadmin-${COMPOSE_PROJECT_NAME}.entryPoints=https
+      - traefik.http.routers.phpmyadmin-${COMPOSE_PROJECT_NAME}.rule=Host(`pma.${MG2_CFG_DOMAIN_NAME}`)
+      - traefik.http.services.phpmyadmin-${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=80
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MG2_CFG_MYSQL_ROOT_PASSWORD:-magento}
+      - MYSQL_USER=${MG2_CFG_MYSQL_USER:-magento}
+      - MYSQL_PASSWORD=${MG2_CFG_MYSQL_PASSWORD:-magento}
+      - PMA_HOST=${MG2_CFG_DOMAIN_NAME}__db
+      - PMA_USER=${MG2_CFG_MYSQL_USER:-magento}
+      - PMA_PASSWORD=${MG2_CFG_MYSQL_PASSWORD:-magento}
+    networks:
+      default:
+        aliases:
+          - pma.${MG2_CFG_DOMAIN_NAME}
+      mg2:
+        aliases:
+          - pma.${MG2_CFG_DOMAIN_NAME}

@@ -1,0 +1,39 @@
+sync:
+  defaults:
+    mode: two-way-resolved
+    ignore:
+      vcs: true
+    permissions:
+      defaultFileMode: 0644
+      defaultDirectoryMode: 0755
+  src:
+    alpha: ./../..${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/
+    beta: docker://${MG2_CFG_DOMAIN_NAME}__php/var/www/html
+    configurationBeta:
+      permissions:
+        defaultOwner: app
+        defaultGroup: app
+    ignore:
+      paths:
+        - .idea
+        - .vscode
+        - .mg2
+        - /.env
+        - /bin
+        - /generated
+        - /pub/media/catalog/product
+        - /pub/static
+        - /var
+        - /vendor
+        - node_modules
+  vendor:
+    alpha: docker://${MG2_CFG_DOMAIN_NAME}__php/var/www/html/vendor
+    beta: ./../..${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/vendor
+    configurationAlpha:
+      permissions:
+        defaultOwner: app
+        defaultGroup: app
+      watch:
+        mode: no-watch
+    symlink:
+      mode: posix-raw

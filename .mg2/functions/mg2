@@ -1,0 +1,3668 @@
+#!/bin/bash
+
+if [[ -z ${mg2_global_dir} ]]
+then
+    echo -e "\033[1;31mThis script intended to be sourced and should not be executed directly!\033[0m"
+    exit 1
+fi
+
+declare -r mg2_varnish_versions=("5.2" "4.1" "6.2")
+declare -r mg2_elasticsearch_versions=("6.8" "6.7" "6.6" "6.5" "6.4" "6.3" "6.2" "6.1" "6.0" \
+                                       "5.6" "5.5" "5.4" "5.3" "5.2" "5.1" "5.0" \
+                                       "2.4" "2.3" "2.2" "2.1" "2.0")
+declare -r mg2_rabbitmq_versions=("3.7" "3.6" "3.5" "3.4" "3.3" "3.2" "3.1" "3.0" \
+                                  "2.8" "2.7" "2.6" "2.5" "2.4" "2.3" "2.2" "2.1" "2.0")
+
+mg2_get_project_dir() {
+    local current_dir="$(pwd)"
+
+    while [[ ! -f "${current_dir}/.env" ]] && [[ "${current_dir}" != ~ ]] && [[ "${current_dir}" != "/" ]]
+    do
+        current_dir="$(cd "${current_dir}/.." >/dev/null 2>&1 && pwd)"
+    done
+
+    [[ "${current_dir}" != ~ ]] && [[ "${current_dir}" != "/" ]] && echo "${current_dir}" || echo "$(pwd)"
+}
+
+mg2_load_env() {
+    mg2_global_load_env
+    mg2_load_project_env
+}
+
+mg2_extra_env() {
+    export MG2_CFG_PROJECT_PATH="${mg2_project_dir}"
+    export MG2_CFG_TRAEFIK_IP="$(docker ps \
+            --filter "label=com.docker.compose.project=mg2" \
+            --filter "label=com.docker.compose.service=traefik" \
+            -qa | xargs docker inspect \
+            --format="{{index .NetworkSettings.Networks.mg2.IPAddress}}")"
+
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+        export MG2_CFG_UID="$(id -u)"
+        export MG2_CFG_GID="$(id -g)"
+    fi
+
+    if [[ -z ${MG2_CFG_DOMAIN_NAMES} ]]
+    then
+        export MG2_CFG_DOMAIN_NAMES="\`${MG2_CFG_DOMAIN_NAME}\`"
+    fi
+
+    export DOCKER_CLIENT_TIMEOUT=600
+    export COMPOSE_FILE=".mg2/docker/docker-compose.yml:.mg2/docker/docker-compose.$([[ -n ${MG2_CFG_VARNISH} ]] && echo "varnish" || echo "nginx").yml${MG2_CFG_PHPMYADMIN:+:.mg2/docker/docker-compose.phpmyadmin.yml}${MG2_CFG_ELASTICSEARCH:+:.mg2/docker/docker-compose.elasticsearch.yml}${MG2_CFG_RABBITMQ:+:.mg2/docker/docker-compose.rabbitmq.yml}:.mg2/docker/docker-compose.${mg2_os}.yml"
+    export COMPOSE_HTTP_TIMEOUT=600
+    export COMPOSE_PATH_SEPARATOR=":"
+    export COMPOSE_PROJECT_NAME="${MG2_CFG_DOMAIN_NAME/.test/}"
+}
+
+mg2_save_project_env() {
+    local config_env="${mg2_project_dir}/.env"
+
+    [[ -f "${config_env}" ]] || mkdir -p "$(dirname "${config_env}")" && touch "${config_env}"
+
+    mg2_extra_env
+
+    set | grep '^MG2_CFG_' > "${config_env}"
+    set | grep '^DOCKER_' >> "${config_env}"
+    set | grep '^COMPOSE_' >> "${config_env}"
+}
+
+mg2_load_project_env() {
+    local config_env="${mg2_project_dir}/.env"
+
+    if [[ -f "${config_env}" ]]
+    then
+        set -a
+        . "${config_env}"
+        set +a
+    fi
+
+    mg2_extra_env
+}
+
+mg2_load_project_defaults_env() {
+    local config_env="${mg2_global_dir}/local/docker/.env"
+
+    [[ -f "${config_env}" ]] && . "${config_env}"
+}
+
+mg2_validate_domain() {
+    local domain=$1
+
+    if [[ -n ${domain} && "${domain}" != "mg2.test" && -n $(echo "$domain" | grep -$([[ "$mg2_os" == "darwin" ]] && echo "E" || echo "P") \
+        '(^(?:[a-zA-Z0-9](?:(?:[a-zA-Z0-9\-]){0,61}[a-zA-Z0-9])?\.)+test$)') ]]
+    then
+        return 0
+    else
+        return 1
+    fi
+}
+
+mg2_validate_in_array() {
+    local values=() value="$1"
+    shift
+    values+=("$@")
+
+    [[ -n ${value} ]] && mg2_in_array "$value" ${values[@]} && return 0 || return 1
+}
+
+mg2_validate_file() {
+    local value=$1
+
+    [[ -n ${value} && -f "${value}" ]] && return 0 || return 1
+}
+
+mg2_validate_url_path() {
+    local value=$1
+
+    [[ -n ${value} && -n $(echo "$value" | grep -$([[ "$mg2_os" == "darwin" ]] && echo "E" || echo "P") \
+        '(^(?:[a-zA-Z0-9](?:(?:[a-zA-Z0-9\-\_])[a-zA-Z0-9])?)+$)') ]] && return 0 || return 1
+}
+
+mg2_validate_not_empty() {
+    local value=$1
+
+    [[ -n ${value} ]] && return 0 || return 1
+}
+
+mg2_rabbitmq_configure() {
+    (
+        mg2_magento --notty setup:config:set --no-interaction --amqp-host=rabbitmq.${MG2_CFG_DOMAIN_NAME} \
+            --amqp-port=5672 --amqp-user=guest --amqp-password=guest --amqp-virtualhost=/ && \
+        mg2_magento --notty setup:upgrade --no-interaction
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_rabbitmq_reset() {
+    (
+        mg2_docker_cp "${MG2_CFG_DOMAIN_NAME}__php":/var/www/html/app/etc/env.php \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php" >/dev/null 2>&1 && \
+        sed -e "/\'queue\' => \[/{N;N;N;N;N;N;N;N;d;}" \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php">\
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php.temp" && \
+        mv "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php.temp" \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php" && \
+        mg2_docker_cp "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php" \
+            "${MG2_CFG_DOMAIN_NAME}__php":/var/www/html/app/etc/env.php && \
+        mg2_magento --notty setup:upgrade --no-interaction
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_elasticsearch_configure() {
+    local version=${MG2_CFG_ELASTICSEARCH:0:1}
+    version=${version/2/}
+
+    (
+        mg2_magento --notty config:set catalog/search/engine elasticsearch${version} && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_server_port 9200 && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_server_timeout 15 && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_enable_auth 0 && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_index_prefix magento2 && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_server_hostname \
+            elasticsearch.${MG2_CFG_DOMAIN_NAME}
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_elasticsearch_reset() {
+    local version=${MG2_CFG_ELASTICSEARCH:0:1}
+    version=${version/2/}
+
+    (
+        mg2_magento --notty config:set catalog/search/engine mysql && \
+        mg2_magento --notty config:set catalog/search/elasticsearch${version}_server_hostname localhost
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_set_opt_version() {
+    local name=$1 versions=() default
+
+    shift
+
+    versions=("$@")
+    default=${versions[0]}
+    error="Invalid $name version, supported versions:\n"
+    error_info="$(
+        for i in "${!versions[@]}"
+        do
+            echo -en "${versions[$i]}\t\t"
+            (( ($i + 1) % 5 == 0 )) && echo -en "\n"
+        done)\n"
+
+    mg2_ask_text "Set $name version for your project:" \
+                 "$default" \
+                 "$error" \
+                 "$error_info" \
+                 mg2_validate_in_array "${versions[@]}"
+
+    case "$name" in
+        "Magento")
+            MG2_CFG_MAGENTO="$mg2_res"
+        ;;
+        "Nginx")
+            MG2_CFG_NGINX="$mg2_res"
+        ;;
+        "PHP")
+            MG2_CFG_PHP="$mg2_res"
+        ;;
+        "MariaDB")
+            MG2_CFG_MARIADB="$mg2_res"
+        ;;
+        "Redis")
+            MG2_CFG_REDIS="$mg2_res"
+        ;;
+        "Varnish")
+            MG2_CFG_VARNISH="$mg2_res"
+        ;;
+        "Elasticsearch")
+            MG2_CFG_ELASTICSEARCH="$mg2_res"
+        ;;
+        "RabbitMQ")
+            MG2_CFG_RABBITMQ="$mg2_res"
+        ;;
+    esac
+
+    mg2_res=
+}
+
+mg2_cli() {
+    local notty \
+          user="app" \
+          service="php" \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            --root)
+                user="root"
+                shift
+            ;;
+            --debug)
+                service="xdebug"
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u ${user} ${notty:+-T} ${service} "${args[@]}"
+}
+
+mg2_bash() {
+    local notty \
+          user="app" \
+          service="php" \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            --root)
+                user="root"
+                shift
+            ;;
+            --debug)
+                service="xdebug"
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u ${user} ${notty:+-T} ${service} env TERM=xterm-256color bash -l "${args[@]}"
+}
+
+mg2_composer() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} php composer "${args[@]}"
+
+    if [[ "$mg2_os" == "darwin" ]]
+    then
+        mg2_msg "\nConsider on pulling vendor directory to the host by running \`mg2 pull vendor\` command if composer packages were changed."
+    fi
+}
+
+mg2_db() {
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_db_help
+
+        case "$1" in
+            mysql)
+                shift
+                mg2_db_mysql "$@"
+            ;;
+            import)
+                shift
+                mg2_db_import "$1"
+            ;;
+            export)
+                mg2_db_export
+            ;;
+            *)
+                mg2_db_error $@
+            ;;
+        esac
+    else
+        mg2_db_help
+    fi
+}
+
+mg2_db_mysql() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec ${notty:+-T} db mysql \
+        -h"db.${MG2_CFG_DOMAIN_NAME}" -u"$MG2_CFG_MYSQL_USER" \
+        -p"$MG2_CFG_MYSQL_PASSWORD" "$MG2_CFG_MYSQL_DATABASE" "${args[@]}"
+}
+
+mg2_db_mysqldump() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec ${notty:+-T} db mysqldump \
+        -h"db.${MG2_CFG_DOMAIN_NAME}" -u"$MG2_CFG_MYSQL_USER" \
+        -p"$MG2_CFG_MYSQL_PASSWORD" "$MG2_CFG_MYSQL_DATABASE" "${args[@]}"
+}
+
+mg2_db_import() {
+    local file="$1" \
+          is_init="$2"
+
+    if [[ -f "${file}" ]]
+    then
+        mg2_info_bold "\n[Importing database]\n\n"
+        mg2_info "$file "
+        mg2_info_bold "→"
+        mg2_info " DB\n\n"
+
+        if file --mime-type "${file}" | grep -q gzip$; then
+            mg2_dots "Unpacking and importing database dump file"
+            mg2_loading
+            (
+                gunzip -c "${file}" | \
+                    LANG=C LC_CTYPE=C LC_ALL=C sed -e 's/DEFINER[ ]*=[ ]*[^*]*\*/\*/' | \
+                    mg2_db_mysql --notty
+            ) >"${mg2_log}" 2>&1
+            mg2_result $?
+        else
+            mg2_dots "Importing database dump file"
+            mg2_loading
+            (
+                cat "${file}" | \
+                    LANG=C LC_CTYPE=C LC_ALL=C sed -e 's/DEFINER[ ]*=[ ]*[^*]*\*/\*/' | \
+                    mg2_db_mysql --notty
+            ) >"${mg2_log}" 2>&1
+            mg2_result $?
+        fi
+
+        [[ -z ${is_init} ]] && mg2_domain_name
+    elif [[ -n ${file} ]]
+    then
+        mg2_error "Cannot locate database dump file at specified path: $file!\n"
+    else
+        mg2_error "Specify full path to plain sql or gzipped database dump file to import.\n"
+    fi
+}
+
+mg2_db_export() {
+    local file="${mg2_project_dir}/db.$(date +%F.%H%M%S).sql.gz"
+
+    mg2_info_bold "\n[Exporting database]\n\n"
+    mg2_info "DB "
+    mg2_info_bold "→"
+    mg2_info " $file\n\n"
+
+    mg2_dots "Creating and compressing database dump file"
+    mg2_loading
+    (
+        mg2_db_mysqldump --single-transaction --quick | \
+            LANG=C LC_CTYPE=C LC_ALL=C sed -e 's/DEFINER[ ]*=[ ]*[^*]*\*/\*/' | \
+            gzip > "${file}"
+    ) >"${mg2_log}" 2>&1
+    mg2_result $?
+}
+
+mg2_db_error() {
+    mg2_error "Unknown argument \`$@\`. Run \`mg2 db --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_db_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Import/Export database commands and MySQL CLI tool access.
+
+\033[1;33mUsage:\033[0m
+  mg2 db [command] [--help]
+
+\033[1;33mCommands:\033[0m
+  mysql     Runs mysql CLI command or open mysql command prompt.
+  export    Exports Magento database to gzip compressed sql dump.
+  import    Imports plain sql or gzipped sql database dump file.
+
+\033[1;33mFlags:\033[0m
+  --help    Displays this information.
+"
+    exit 0
+}
+
+mg2_global() {
+    mg2_in_array "--help" $@ && mg2_global_help
+
+    case "$1" in
+        add)
+            shift
+            mg2_global_add "$@"
+        ;;
+        autostart)
+            shift
+            mg2_global_autostart "$@"
+        ;;
+        info|status)
+            mg2_global_info
+        ;;
+        projects)
+            mg2_global_projects
+        ;;
+        remove)
+            shift
+            mg2_global_remove "$@"
+        ;;
+        uninstall)
+            mg2_global_uninstall
+        ;;
+        update)
+            mg2_global_update
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_global_help
+            else
+                local mg2_global_services=($(mg2_global_list_services))
+                local mg2_global_service=()
+                local mg2_global_command=
+
+                while (("$#")); do
+                    case "$1" in
+                        up|start|restart|stop)
+                            mg2_global_command="$1"
+                            shift
+                        ;;
+                        portainer|mailhog|dnsmasq|traefik|mg121ecommerce)
+                            mg2_global_service+=($1)
+                            shift
+                        ;;
+                        portainer|mailhog|dnsmasq|traefik|mg121ecommerce)
+                            if ! [[ "$1" == "portainer" && -z ${mg2_GLOBAL_PORTAINER} || \
+                                    "$1" == "mailhog" && -z ${mg2_GLOBAL_MAILHOG} ]]
+                            then
+                                mg2_global_service+=("$1")
+                            fi
+                            shift
+                        ;;
+                        *)
+                            if mg2_in_array "$1" ${mg2_global_services[@]}
+                            then
+                                mg2_global_service+=("$1")
+                                shift
+                            else
+                                mg2_global_error "$1" "$mg2_global_command"
+                            fi
+                        ;;
+                    esac
+                done
+
+                (("${#mg2_global_service[@]}")) || mg2_global_service+=${mg2_global_services[@]}
+
+                case ${mg2_global_command} in
+                    up)
+                        mg2_global_up "${mg2_global_service[@]}"
+                    ;;
+                    start)
+                        mg2_global_start "${mg2_global_service[@]}"
+                    ;;
+                    restart)
+                        mg2_global_restart "${mg2_global_service[@]}"
+                    ;;
+                    stop)
+                        mg2_global_stop "${mg2_global_service[@]}"
+                    ;;
+                esac
+            fi
+        ;;
+    esac
+}
+
+mg2_global_list_services() {
+    echo "$(
+        cd "${mg2_global_dir}/" && \
+        yes | docker-compose ps --services --all
+    )"
+    return $?
+}
+
+mg2_global_error() {
+    mg2_error "Unknown argument \`$1\`. Run \`mg2 global$([[ "$2" != "" ]] && \
+        echo " $2") --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_global_load_env() {
+    local config_env="${mg2_global_dir}/.env"
+
+    [[ -f "${config_env}" ]] && . "${config_env}"
+
+    mg2_global_extra_env
+}
+
+mg2_global_save_env() {
+    local config_env="${mg2_global_dir}/.env"
+
+    [[ -f "${config_env}" ]] || mkdir -p "$(dirname "${config_env}")" && touch "${config_env}"
+
+    mg2_global_extra_env
+
+    set | grep '^mg2_GLOBAL_' > "${config_env}"
+    set | grep '^DOCKER_' >> "${config_env}"
+    set | grep '^COMPOSE_' >> "${config_env}"
+
+    if [[ -f "${mg2_global_dir}/docker/.env" ]]
+    then
+        rm -f "${mg2_global_dir}/docker/.env" >/dev/null 2>&1
+    fi
+}
+
+mg2_global_extra_env() {
+    export DOCKER_CLIENT_TIMEOUT=600
+    export COMPOSE_FILE="docker/docker-compose.yml${mg2_GLOBAL_PORTAINER:+:docker/docker-compose.portainer.yml}${mg2_GLOBAL_MAILHOG:+:docker/docker-compose.mailhog.yml}"
+    export COMPOSE_HTTP_TIMEOUT=600
+    export COMPOSE_PATH_SEPARATOR=":"
+    export COMPOSE_PROJECT_NAME="mg2"
+}
+
+mg2_global_add() {
+    mg2_in_array "--help" $@ && mg2_global_add_help
+
+    case "$@" in
+        portainer)
+            mg2_ask_bool "\nAdd Portainer service to mg121ecommerce toolset?"
+            mg2_GLOBAL_PORTAINER=${mg2_res}
+
+            if [[ -n ${mg2_GLOBAL_PORTAINER} ]]
+            then
+                mg2_GLOBAL_PORTAINER="1.23.2"
+                mg2_global_save_env
+                mg2_global_up portainer
+            fi
+        ;;
+        mailhog)
+            mg2_ask_bool "\nAdd Mailhog service to mg121ecommerce toolset?"
+            mg2_GLOBAL_MAILHOG=${mg2_res}
+
+            if [[ -n ${mg2_GLOBAL_MAILHOG} ]]
+            then
+                mg2_GLOBAL_MAILHOG="v1.0.0"
+                mg2_global_save_env
+                mg2_global_up mailhog
+            fi
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_global_add_help
+            else
+                mg2_global_error "$*" "add"
+            fi
+        ;;
+    esac
+}
+
+mg2_global_add_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Adds optional service to mg121ecommerce toolset.
+
+\033[1;33mUsage:\033[0m
+  mg2 global add <service> [--help]
+  mg2 global add [--help]
+
+\033[1;33mServices:\033[0m
+  portainer         Portainer service.
+  mailhog           Mailhog service.
+
+\033[1;33mFlags:\033[0m
+  --help            Displays this information.
+"
+    exit 0
+}
+
+mg2_global_remove() {
+    local service=
+
+    mg2_in_array "--help" $@ && mg2_global_remove_help
+
+    case "$@" in
+        portainer)
+            mg2_ask_bool "\nRemove Portainer service from mg121ecommerce toolset?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+                mg2_GLOBAL_PORTAINER=
+            fi
+        ;;
+        mailhog)
+            mg2_ask_bool "\nRemove Mailhog service from mg121ecommerce toolset?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+                mg2_GLOBAL_MAILHOG=
+            fi
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_global_remove_help
+            else
+                mg2_global_error "$*" "remove"
+            fi
+        ;;
+    esac
+
+    if [[ -n ${service} ]]
+    then
+        mg2_info_bold "\n[Removing docker container]\n\n"
+        mg2_print_service "$service"
+        mg2_loading
+        mg2_global_container_remove "$service"
+        mg2_result $?
+
+        mg2_global_save_env
+    fi
+}
+
+mg2_global_remove_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Removes optional service from mg121ecommerce toolset.
+
+\033[1;33mUsage:\033[0m
+  mg2 global remove <service> [--help]
+  mg2 global remove [--help]
+
+\033[1;33mServices:\033[0m
+  portainer         Portainer service.
+  mailhog           Mailhog service.
+
+\033[1;33mFlags:\033[0m
+  --help            Displays this information.
+"
+    exit 0
+}
+
+mg2_global_container_remove() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        local volumes="$(docker volume ls \
+            --filter "label=com.docker.compose.project=mg2" \
+            -q | grep "mg2_${service}")"
+
+        cd "${mg2_global_dir}/" && \
+        docker-compose rm --force --stop -v "${service}" >"${mg2_log}" 2>&1 && \
+        (
+            [[ -n "${volumes}" ]] && docker volume rm --force "${volumes}" >"${mg2_log}" 2>&1 || true
+        )
+
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_global_up() {
+    local service=($1)
+
+    mg2_info_bold "\n[Creating docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service ${service[$i]}
+        mg2_loading
+        (
+            cd "${mg2_global_dir}/" && \
+            yes | docker-compose --project-name mg2 up \
+                --detach --force-recreate --no-color --no-deps ${service[$i]}
+        ) >"${mg2_log}" 2>&1
+        mg2_result $?
+    done
+}
+
+mg2_global_start() {
+    local service=($1)
+
+    mg2_info_bold "\n[Starting docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service ${service[$i]}
+        mg2_loading
+        docker start $(docker ps \
+            --filter "label=com.docker.compose.project=mg2" \
+            --filter "label=com.docker.compose.service=${service[$i]}" \
+            -qa) >"${mg2_log}" 2>&1
+        mg2_result $?
+    done
+}
+
+mg2_global_restart() {
+    local service=($1)
+
+    mg2_info_bold "\n[Restarting docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service ${service[$i]}
+        mg2_loading
+        docker restart $(docker ps \
+            --filter "label=com.docker.compose.project=mg2" \
+            --filter "label=com.docker.compose.service=${service[$i]}" \
+            -qa) >"${mg2_log}" 2>&1
+        mg2_result $?
+    done
+}
+
+mg2_global_stop() {
+    local service=($1)
+
+    mg2_info_bold "\n[Stopping docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service ${service[$i]}
+        mg2_loading
+        docker stop $(docker ps \
+            --filter "label=com.docker.compose.project=mg2" \
+            --filter "label=com.docker.compose.service=${service[$i]}" \
+            -qa) >"${mg2_log}" 2>&1
+        mg2_result $?
+    done
+}
+
+mg2_global_projects() {
+    mg2_logo
+
+    local projects="$(docker ps --filter "label=mg2.project.path" -qa | \
+        xargs docker inspect --format='{{index .Config.Labels "com.docker.compose.project"}}' | \
+        uniq)"
+    local spaces containers
+
+    projects=(${projects})
+
+    for i in "${!projects[@]}"
+    do
+        spaces="$(printf "%-${#projects[$i]}s" " ")"
+        containers="$(docker ps \
+            --filter "label=com.docker.compose.project=${projects[$i]}" \
+            --format 'table {{.ID}}  {{.Names}}\t{{.Image}}\t{{.Status}}' -a | \
+            sed "s/${projects[$i]}.test__//; s/${spaces}       IMAGE/IMAGE/")\n\n"
+
+        mg2_msg "=========================================================================\n\n"
+        mg2_info "Project: "
+        mg2_info_bold "$(echo "${projects[$i]}" | sed 's/.*/https:\/\/&.test/')\n"
+        if echo "$containers" | grep -q "phpmyadmin"
+        then
+            mg2_info "phpMyAdmin: "
+            mg2_info_bold "$(echo "${projects[$i]}" | sed 's/.*/https:\/\/pma.&.test/')\n"
+        fi
+        if echo "$containers" | grep -q "elasticsearch"
+        then
+            mg2_info "Elasticsearch: "
+            mg2_info_bold "$(echo "${projects[$i]}" | sed 's/.*/https:\/\/elasticsearch.&.test/')\n"
+        fi
+        if echo "$containers" | grep -q "rabbitmq"
+        then
+            mg2_info "RabbitMQ: "
+            mg2_info_bold "$(echo "${projects[$i]}" | sed 's/.*/https:\/\/rabbitmq.&.test/')\n"
+        fi
+        mg2_info "Path: "
+        mg2_info_bold "$(docker inspect --format='{{index .Config.Labels "mg2.project.path"}}' \
+            "${projects[$i]}.test__php")\n\n"
+        mg2_msg "$containers"
+    done
+
+    mg2_msg "=========================================================================\n"
+    exit 0
+}
+
+mg2_global_autostart() {
+    case "$@" in
+        1|enable|enabled|on|true)
+            mg2_GLOBAL_SERVICES_AUTO_START="always"
+            mg2_global_save_env
+            mg2_global up
+            mg2_msg "\nToolset related global docker services will be started automatically with docker startup.\n"
+        ;;
+        0|disable|disabled|off|false)
+            mg2_GLOBAL_SERVICES_AUTO_START="no"
+            mg2_global_save_env
+            mg2_global up
+            mg2_msg "\nToolset related global docker services won't be started automatically with docker startup.\n"
+        ;;
+        status)
+            mg2_msg "Toolset related global docker services autostart is $([[ "$mg2_GLOBAL_SERVICES_AUTO_START" == "always" ]] && echo "ON" || echo "OFF").\n"
+        ;;
+        *)
+            mg2_global_error "$@"
+        ;;
+    esac
+}
+
+mg2_global_info() {
+    local project="mg2"
+    local spaces="$(printf "%-${#project}s" " ")"
+    local containers="$(docker ps \
+            --filter "label=com.docker.compose.project=${project}" \
+            --format 'table {{.ID}}  {{.Names}}\t{{.Image}}\t{{.Status}}' -a | \
+            sed "s/${project}.test__//; s/${spaces}       IMAGE/IMAGE/")\n"
+
+    mg2_info "\nmg121ecommerce: "
+    mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/&.test/')\n"
+    if echo "$containers" | grep -q "traefik"
+    then
+        mg2_info "Traefik: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/traefik.&.test/')\n"
+    fi
+    if echo "$containers" | grep -q "portainer"
+    then
+        mg2_info "Portainer: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/portainer.&.test/')\n"
+    fi
+    if echo "$containers" | grep -q "mailhog"
+    then
+        mg2_info "Mailhog: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/mailhog.&.test/')\n"
+    fi
+    if echo "$containers" | grep -q "dnsmasq"
+    then
+        mg2_info "Dnsmasq: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/dnsmasq.&.test/')\n"
+    fi
+    mg2_msg "\n$containers"
+    exit 0
+}
+
+mg2_global_update() {
+    local build="$(<"${mg2_global_dir}/build")" \
+          remote_version
+
+    mg2_info_bold "\n[Update]\n\n"
+    mg2_dots "Checking for update"
+    mg2_loading
+    remote_build="$(curl -sL https://raw.githubusercontent.com/zerocool78/mg2/master/.mg2/build)"
+
+    if [[ "$remote_build" -gt "$build" ]]
+    then
+        curl -sL -o mg2.run raw.githubusercontent.com/zerocool78/mg2/master/mg2 && \
+            mg2_result 0 && \
+            chmod 755 mg2.run && \
+            ./mg2.run
+    else
+        mg2_result 0
+        mg2_logo
+        mg2_msg "You’re up-to-date! v$mg2_version is currently the newest version available.\n"
+    fi
+
+    exit 0
+}
+
+mg2_global_uninstall() {
+    local message
+
+    mg2_msg "\nAttention!\n\n"
+    mg2_msg "All projects docker containers and its volumes will be removed!\n"
+    mg2_msg "Projects files on the host will not be touched. Make sure that you backed up projects databases. Use \`mg2 db export\` per project to create database dump file as backup.\n\n"
+
+    mg2_ask_bool "Uninstall mg121ecommerce toolset from your system?"
+
+    if [[ -n ${mg2_res} ]]
+    then
+        local projects="$(docker ps --filter "label=mg2.project.path" -qa | \
+            xargs docker inspect --format='{{index .Config.Labels "com.docker.compose.project"}}' | \
+            uniq) mg2"
+
+        projects=(${projects})
+
+        mg2_info_bold "\n[Uninstall]\n\n"
+
+        mg2_mutagen daemon stop >/dev/null 2>&1
+
+        for i in "${!projects[@]}"
+        do
+            message="Uninstalling"
+            if [[ "${projects[$i]}" == "mg2" ]]
+            then
+                message="$message mg121ecommerce"
+            else
+                message="$message project"
+            fi
+            message="$message $(echo "${projects[$i]}" | sed 's/.*/https:\/\/&.test/')"
+
+            mg2_dots "$message"
+            mg2_loading
+            true
+
+            local containers="$(docker ps \
+                --filter "label=com.docker.compose.project=${projects[$i]}" \
+                -qa)"
+
+            local volumes="$(docker volume ls \
+                --filter "label=com.docker.compose.project=${projects[$i]}" \
+                -q)"
+
+            local networks="$(docker network ls \
+                --filter "label=com.docker.compose.project=${projects[$i]}" \
+                -q)"
+
+            (
+                [[ -n ${containers} ]] && docker rm --force --volumes ${containers} >"${mg2_log}" 2>&1 || true
+            ) && \
+            (
+                [[ -n ${volumes} ]] && docker volume rm --force ${volumes} >"${mg2_log}" 2>&1 || true
+            ) && \
+            (
+                [[ -n ${networks} ]] && docker network rm ${networks} >"${mg2_log}" 2>&1 || true
+            )
+
+            mg2_result $?
+        done
+
+        mg2_dots "Removing mg121ecommerce files and directories"
+        mg2_loading
+        rm -rf "${mg2_global_dir}" >/dev/null 2>&1 && \
+        rm -rf /usr/local/bin/mg2 && \
+        rm -rf /usr/local/etc/bash_completion.d/mg2
+        mg2_result $?
+    fi
+
+    exit 0
+}
+
+mg2_global_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Control mg121ecommerce toolset installation and its docker services.
+
+\033[1;33mUsage:\033[0m
+  mg2 global <command> [--help]
+
+  mg2 global <restart|start|stop|up> [service...]
+  mg2 global add <service> [--help]
+  mg2 global autostart <on|off> [--help]
+  mg2 global remove <service> [--help]
+
+\033[1;33mCommands:\033[0m
+  add           Adds optional service to mg121ecommerce toolset.
+  autostart     Configure autostart of toolset docker services.
+  projects      Show existing mg121ecommerce-backed projects.
+  remove        Removes optional service from mg121ecommerce toolset.
+  restart       Restart mg121ecommerce toolset docker services.
+  start         Start stopped mg121ecommerce toolset docker services.
+  stop          Stop running mg121ecommerce toolset docker services.
+  up            Create and start mg121ecommerce toolset docker containers,
+                networks and services.
+  update        Check mg121ecommerce toolset for updates.
+  uninstall     Uninstall mg121ecommerce toolset from system.
+
+\033[1;33mServices:\033[0m
+  dnsmasq       Dnsmasq service.
+  mg121ecommerce    mg121ecommerce service.
+  mailhog       Mailhog service.
+  portainer     Portainer service.
+  traefik       Traefik service.
+
+\033[1;33mFlags:\033[0m
+  --help        Display this information.
+"
+    exit 0
+}
+
+mg2_grunt() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} php grunt "${args[@]}"
+}
+
+mg2_npm() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} php npm "${args[@]}"
+}
+
+mg2_node() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} php node "${args[@]}"
+}
+
+mg2_redis() {
+    docker-compose exec redis redis-cli "$@"
+}
+
+mg2_urn() {
+    mg2_info_bold "\n[URN Highlighter]\n\n"
+
+    mg2_dots "Creating PhpStorm configuration"
+    mg2_loading
+    mg2_cli --notty mkdir .idea >/dev/null 2>&1 && \
+    mg2_magento dev:urn-catalog:generate .idea/misc.xml >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mkdir -p "${mg2_project_dir}/.idea"
+    mg2_pull .idea/misc.xml
+
+    sed -i .prev -e 's?/var/www/html?'${mg2_project_dir}'?g' \
+            "${mg2_project_dir}/.idea/misc.xml"
+
+    if [[ -n ${MG2_CFG_MAGENTO_SRC} ]] && [[ -d "${mg2_project_dir}/${MG2_CFG_MAGENTO_SRC}/.idea" ]]
+    then
+        yes | cp -rf "${mg2_project_dir}/.idea/misc.xml" "${mg2_project_dir}/${MG2_CFG_MAGENTO_SRC}/.idea"
+    fi
+
+    mg2_cli --notty rm -rf .idea >/dev/null 2>&1
+
+    mg2_msg "\nUniform Resource Names have been generated!"
+    mg2_msg "\nRestart PHPStorm to get changes applied.\n"
+}
+
+mg2_help() {
+    mg2_logo
+
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+    echo -e "
+\033[1;33mUsage:\033[0m
+  mg2 <command> [arguments...] [--help]
+
+\033[1;33mCommands:\033[0m
+  add           Adds optional service or extra domain to the project.
+                Run \`mg2 add --help\` for command usage information.
+  bash          Opens the bash prompt on the project's php Docker service.
+                With \`--debug\` flag, the bash prompt will be opened on the
+                project's xdebug Docker service. With \`--root\` flag, the root
+                user will be used.
+  cli           Runs any CLI command without going into the bash prompt. With
+                \`--root\` flag, the root user will be used.
+  composer      Composer command-line interface. Runs Composer specific
+                commands.
+  db            Database related commands. Import/Export database commands and
+                MySQL CLI tool access. Run \`mg2 db --help\` for command usage
+                information.
+  down          Removes project Docker containers, volumes, and networks.
+                Project sources on the host will be untouched. Don't forget to
+                create a database backup before running this command.
+  grunt         The grunt command-line interface. Runs grunt specific commands
+                at projects Docker containers.
+  info          Prints project info and Docker containers status.
+  init          Initializes project in the current directory. Run
+                \`mg2 init --help\` for command usage information.
+  magento, m    Magento command-line tool interface. Runs bin/magento specific
+                commands. With \`--debug\` flag, commands will be executed on
+                the project's xdebug Docker service.
+  magerun, mr   n98-magerun command-line tool interface. Runs n98-magerun
+                specific commands.
+  node          Run node specific commands.
+  npm           Run npm specific commands.
+  pwa           Run PWA Studio related commands and wrapper for \`yarn run\`
+                command inside of project directory.
+  redis         Run redis specific commands.
+  remove        Remove optional service from project.
+  restart       Restart running docker services and starts all stopped ones.
+  share         Start sharing session over secure ngrok tunnels.
+  sign          Sign specified domain name with ssl certificate.
+  start         Start all stopped docker services.
+  status        Print project info and status.
+  stop          Stop all running docker services.
+  update        Update docker configuration to latest version.
+  urn           Generate URN for PHPStorm and remap paths for the host.
+  varnish       Run varnish specific commands.
+
+\033[1;33mFlags:\033[0m
+  --help        Display this information. To get information about the specific
+                command, use with corresponding command name.
+"
+    else
+    echo -e "
+\033[1;33mUsage:\033[0m
+  mg2 <command> [args...] [--help]
+
+\033[1;33mCommands:\033[0m
+  add           Adds optional service or extra domain to the project.
+                Run \`mg2 add --help\` for command usage information.
+  bash          Opens the bash prompt on the project's php Docker service.
+                With \`--debug\` flag, the bash prompt will be opened on the
+                project's xdebug Docker service. With \`--root\` flag, the root
+                user will be used.
+  cli           Runs any CLI command without going into the bash prompt. With
+                \`--root\` flag, the root user will be used.
+  composer      Composer command-line interface. Runs Composer specific
+                commands.
+  db            Database related commands. Import/Export database commands and
+                MySQL CLI tool access. Run \`mg2 db --help\` for command usage
+                information.
+  down          Removes project Docker containers, volumes, and networks.
+                Project sources on the host will be untouched. Don't forget to
+                create a database backup before running this command.
+  grunt         The grunt command-line interface. Runs grunt specific commands
+                at projects Docker containers.
+  info          Prints project info and Docker containers status.
+  init          Initializes project in the current directory. Run
+                \`mg2 init --help\` for command usage information.
+  magento, m    Magento command-line tool interface. Runs bin/magento specific
+                commands. With \`--debug\` flag, commands will be executed on
+                the project's xdebug Docker service.
+  magerun, mr   n98-magerun command-line tool interface. Runs n98-magerun
+                specific commands.
+  mutagen       Run mutagen.io sync related commands.
+  node          Run node specific commands.
+  npm           Run npm specific commands.
+  pull          Pull specified file or directory from docker container.
+  push          Push specified file or directory to docker container.
+  pwa           Run PWA Studio related commands and wrapper for \`yarn run\`
+                command inside of project directory.
+  redis         Run redis specific commands.
+  remove        Remove optional service from project.
+  restart       Restart running docker services and starts all stopped ones.
+  share         Start sharing session over secure ngrok tunnels.
+  sign          Sign specified domain name with ssl certificate.
+  start         Start all stopped docker services.
+  status        Print project info and status.
+  stop          Stop all running docker services.
+  sync          Control mutagen.io files sync with docker containers.
+  update        Update docker configuration to latest version.
+  urn           Generate URN for PHPStorm and remap paths for the host.
+  varnish       Run varnish specific commands.
+
+\033[1;33mFlags:\033[0m
+  --help        Display this information. To get information about the specific
+                command, use with corresponding command name.
+"
+    fi
+
+    exit 0
+}
+
+mg2_init() {
+    local mg2_nginx_versions=("1.17" "1.16" "1.15" "1.14" "1.13" "1.12")
+    local mg2_php_versions=("7.3" "7.2" "7.1" "7.0" "5.6" "7.4")
+    local mg2_mariadb_versions=("10.3" "10.2" "10.1" "10.0")
+    local mg2_redis_versions=("5.0" "4.0" "3.2")
+    local mg2_magento_versions=("2.3.5" "2.3.4" "2.3.3" "2.3.2" "2.3.1" "2.3.0" \
+            "2.2.9" "2.2.8" "2.2.7" "2.2.6" "2.2.5" "2.2.4" "2.2.3" "2.2.2" "2.2.1" "2.2.0" \
+            "2.1.18" "2.1.17" "2.1.16" "2.1.15" "2.1.14" "2.1.13" "2.1.12" "2.1.11" "2.1.10" \
+            "2.1.9" "2.1.8" "2.1.7" "2.1.6" "2.1.5" "2.1.4" "2.1.3" "2.1.2" "2.1.1" "2.1.0" \
+            "2.0.18" "2.0.17" "2.0.16" "2.0.15" "2.0.14" "2.0.13" "2.0.12" "2.0.11" "2.0.10" \
+            "2.0.9" "2.0.8" "2.0.7" "2.0.6" "2.0.5" "2.0.4" "2.0.3" "2.0.2" "2.0.1" "2.0.0")
+#            "1.9.4.2" "1.9.4.1" "1.9.4.0" \
+#            "1.9.3.10" "1.9.3.9" "1.9.3.8" "1.9.3.7" "1.9.3.6" "1.9.3.4" "1.9.3.3" "1.9.3.2" \
+#            "1.9.3.1" "1.9.3.0" \
+#            "1.9.2.4" "1.9.2.3" "1.9.2.2" "1.9.2.1" "1.9.2.0" \
+#            "1.9.1.1" "1.9.1.0" \
+#            "1.9.0.1" "1.9.0.0" \
+#            "1.8.1.0" "1.8.0.0" \
+#            "1.7.0.2" "1.7.0.1" "1.7.0.0")
+    local mg2_init_params=("--domain" "--nginx-version" "--php-version" "--mariadb-version" "--redis-version" \
+            "--varnish-version" "--elasticsearch-version" "--rabbitmq-version" "--magento-version" \
+            "--magento-admin-url" "--magento-import-db" "--elasticsearch"  "--phpmyadmin" \
+            "--rabbitmq" "--varnish" "--magento-sample-data" "--magento-sub-dir")
+    local mg2_magento_exists=
+    local mg2_magento_db_import=
+    local mg2_magento_sample_data=
+
+    mg2_in_array "--help" $@ && mg2_init_help
+
+    mg2_ask_bool "\nInitialize project in the current directory?"
+
+    if [[ -z ${mg2_res} ]]
+    then
+        exit 0
+    else
+        mg2_erase_prev_lines 2
+    fi
+
+    if (("$#"))
+    then
+        mg2_load_project_defaults_env
+
+        while (("$#"))
+        do
+            case "$1" in
+                --*)
+                    param=$1
+
+                    if ! mg2_in_array "$param" ${mg2_init_params[@]}
+                    then
+                        mg2_init_error "$param"
+                    fi
+
+                    case "$param" in
+                        --domain|--domain=*)
+                            if [[ "$param" == "--domain" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            if ! mg2_validate_domain "$value"
+                            then
+                                mg2_error_bold \
+                                    "Invalid domain name $value!\nOnly valid domain names with .test tld are supported!\n"
+                                exit 1
+                            fi
+
+                            MG2_CFG_DOMAIN_NAME="$value"
+                            MG2_CFG_DOMAIN_NAMES="\`$value\`"
+                        ;;
+                        --magento-admin-url|--magento-admin-url=*)
+                            if [[ "$param" == "--magento-admin-url" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            if ! mg2_validate_url_path "$value"
+                            then
+                                mg2_error_bold "Invalid admin url path $value!\n"
+                                exit 1
+                            fi
+
+                            MG2_CFG_ADMIN_URL="$value"
+                        ;;
+                        --magento-sub-dir|--magento-sub-dir=*)
+                            if [[ "$param" == "--magento-sub-dir" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            if ! mg2_validate_url_path "$value"
+                            then
+                                mg2_error_bold "Invalid sub-directory name $value!\n"
+                                exit 1
+                            fi
+
+                            MG2_CFG_MAGENTO_SRC="$value"
+                        ;;
+                        --nginx-version|--nginx-version=*)
+                            if [[ "$param" == "--nginx-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "Nginx" "$value" "${mg2_nginx_versions[@]}"
+
+                            MG2_CFG_NGINX="$value"
+                        ;;
+                        --php-version|--php-version=*)
+                            if [[ "$param" == "--php-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "PHP" "$value" "${mg2_php_versions[@]}"
+
+                            MG2_CFG_PHP="$value"
+                        ;;
+                        --mariadb-version|--mariadb-version=*)
+                            if [[ "$param" == "--mariadb-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "MariaDB" "$value" "${mg2_mariadb_versions[@]}"
+
+                            MG2_CFG_MARIADB="$value"
+                        ;;
+                        --redis-version|--redis-version=*)
+                            if [[ "$param" == "--redis-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "Redis" "$value" "${mg2_redis_versions[@]}"
+
+                            MG2_CFG_REDIS="$value"
+                        ;;
+                        --varnish-version|--varnish-version=*)
+                            if [[ "$param" == "--varnish-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "Varnish" "$value" "${mg2_varnish_versions[@]}"
+
+                            MG2_CFG_VARNISH="$value"
+                        ;;
+                        --elasticsearch-version|--elasticsearch-version=*)
+                            if [[ "$param" == "--elasticsearch-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "Elasticsearch" "$value" "${mg2_elasticsearch_versions[@]}"
+
+                            MG2_CFG_ELASTICSEARCH="$value"
+                        ;;
+                        --rabbitmq-version|--rabbitmq-version=*)
+                            if [[ "$param" == "--rabbitmq-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "RabbitMQ" "$value" "${mg2_rabbitmq_versions[@]}"
+
+                            MG2_CFG_RABBITMQ="$value"
+                        ;;
+                        --magento-version|--magento-version=*)
+                            if [[ "$param" == "--magento-version" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            mg2_init_check_version "Magento" "$value" "${mg2_magento_versions[@]}"
+
+                            MG2_CFG_MAGENTO="$value"
+                        ;;
+                        --magento-import-db|--magento-import-db=*)
+                            if [[ "$param" == "--magento-import-db" ]]
+                            then
+                                shift
+                                value="$1"
+                            else
+                                value="${param#*=}"
+                            fi
+
+                            if ! mg2_validate_file "$value"
+                            then
+                                mg2_error_bold \
+                                    "Cannot locate database dump file at specified path: $value!\n"
+                                exit 1
+                            fi
+
+                            mg2_magento_db_import="$value"
+                        ;;
+                        --phpmyadmin)
+                            MG2_CFG_PHPMYADMIN=1
+                        ;;
+                        --magento-sample-data)
+                            mg2_magento_sample_data=1
+                        ;;
+                    esac
+
+                    shift
+                ;;
+                *)
+                    mg2_init_error "$1"
+                ;;
+            esac
+        done
+
+        mg2_save_project_env
+        mg2_logo
+    else
+        mg2_logo
+        mg2_info_bold "\n[Initializing project]\n\n"
+
+        mg2_dots "Scanning current directory"
+        mg2_loading && mg2_result 0
+
+        if [[ ! -f "${mg2_project_dir}/.env" ]]
+        then
+            mg2_load_project_defaults_env
+
+            mg2_msg "\nProject .env file is not found, starting interactive setup\n\n"
+
+            mg2_ask_text "Set the domain name for your project:" \
+                         "$(basename "${mg2_project_dir}" | awk '{print tolower($0)}').test" \
+                         "Invalid domain name: %s!\nOnly valid domain names with .test tld are supported!\n" \
+                         "" \
+                         mg2_validate_domain
+
+            MG2_CFG_DOMAIN_NAME="$mg2_res"
+            MG2_CFG_DOMAIN_NAMES="\`$mg2_res\`"
+
+            mg2_info_bold "\n[Configure sources path]\n\n"
+
+            mg2_ask_bool "Set sub-directory for Magento installation?"
+            MG2_CFG_MAGENTO_SRC=${mg2_res}
+
+            if [[ -n ${MG2_CFG_MAGENTO_SRC} ]]
+            then
+                mg2_ask_text "Set the sub-directory name:" \
+                     "src" \
+                     "Invalid sub-directory name: %s!\n" \
+                     "" \
+                     mg2_validate_url_path
+
+                MG2_CFG_MAGENTO_SRC="$mg2_res"
+            fi
+
+            mg2_info_bold "\n[Configure environment]\n\n"
+
+            mg2_set_opt_version "Nginx" "${mg2_nginx_versions[@]}"
+
+            mg2_set_opt_version "PHP" "${mg2_php_versions[@]}"
+
+            mg2_set_opt_version "MariaDB" "${mg2_mariadb_versions[@]}"
+
+            mg2_set_opt_version "Redis" "${mg2_redis_versions[@]}"
+
+            mg2_info_bold "\n[Configure environment extras]\n\n"
+
+            mg2_ask_bool "Include Varnish service?"
+            MG2_CFG_VARNISH=${mg2_res}
+
+            if [[ -n ${MG2_CFG_VARNISH} ]]
+            then
+                mg2_set_opt_version "Varnish" "${mg2_varnish_versions[@]}"
+            fi
+
+            mg2_ask_bool "Include Elasticsearch service?"
+            MG2_CFG_ELASTICSEARCH=${mg2_res}
+
+            if [[ -n ${MG2_CFG_ELASTICSEARCH} ]]
+            then
+                mg2_set_opt_version "Elasticsearch" "${mg2_elasticsearch_versions[@]}"
+            fi
+
+            mg2_ask_bool "Include RabbitMQ service?"
+            MG2_CFG_RABBITMQ=${mg2_res}
+
+            if [[ -n ${MG2_CFG_RABBITMQ} ]]
+            then
+                mg2_set_opt_version "RabbitMQ" "${mg2_rabbitmq_versions[@]}"
+            fi
+
+            mg2_ask_bool "Include phpMyAdmin service?"
+            MG2_CFG_PHPMYADMIN=${mg2_res}
+
+            mg2_info_bold "\n[Configure Magento installation]\n\n"
+
+            if mg2_init_detect_magento
+            then
+                mg2_magento_exists=1
+            else
+                mg2_set_opt_version "Magento" "${mg2_magento_versions[@]}"
+
+                if [[ "${MG2_CFG_MAGENTO:0:1}" == "2" ]]
+                then
+                    mg2_ask_bool "Include Magento sample data?"
+                    mg2_magento_sample_data=${mg2_res}
+                fi
+            fi
+
+            if [[ -z ${MG2_CFG_ADMIN_URL} ]]
+            then
+                mg2_ask_text "Set the Magento admin url path:" \
+                         "admin" \
+                         "Invalid admin url path: %s!\n" \
+                         "" \
+                         mg2_validate_url_path
+
+                MG2_CFG_ADMIN_URL="$mg2_res"
+            fi
+
+            mg2_save_project_env
+        else
+            mg2_load_project_env
+
+            mg2_dots "Project .env file is found, proceeding with setup"
+            mg2_loading && mg2_result 0
+
+            if mg2_init_detect_magento
+            then
+                mg2_magento_exists=1
+            fi
+
+            mg2_save_project_env
+        fi
+
+        mg2_init_composer_auth
+
+        if [[ -n ${mg2_magento_exists} && -z ${mg2_magento_db_import} ]]
+        then
+            mg2_info_bold "\n[Configure Database]\n\n"
+
+            mg2_ask_bool "Import existing database?"
+            mg2_magento_db_import=${mg2_res}
+
+            if [[ -n ${mg2_magento_db_import} ]]
+            then
+                mg2_magento_db_import=
+
+                mg2_msg "\nSpecify full path to plain sql or gzipped database dump file to import.\n\n"
+
+                mg2_ask_text "Set the database dump file path:" \
+                             "" \
+                             "Cannot locate database dump file at specified path: %s!\n" \
+                             "" \
+                             mg2_validate_file
+
+                mg2_magento_db_import="$mg2_res"
+            fi
+        fi
+    fi
+
+    local url version_name file_name cached_path temp_path
+
+    mkdir -p "${mg2_project_dir}/.mg2/mutagen" "${mg2_project_dir}/.mg2/docker" \
+         "${mg2_project_dir}/.mg2/mysql"
+    yes | cp -rf "${mg2_global_dir}"/local/docker/* "${mg2_project_dir}/.mg2/docker/"
+    yes | cp -rf "${mg2_global_dir}/local/mutagen/mutagen.yml" "${mg2_project_dir}/.mg2/mutagen/mutagen.yml"
+    yes | cp -rf "${mg2_global_dir}/local/mysql/custom.cnf" "${mg2_project_dir}/.mg2/mysql/custom.cnf"
+    rm -rf "${mg2_project_dir}/.mg2/mutagen/mutagen.yml.lock" >/dev/null 2>&1
+
+    if [[ -z ${mg2_magento_exists} ]]
+    then
+        version_name="${MG2_CFG_MAGENTO}"
+        if [[ "${version_name}" == "2.3.5" ]]
+        then
+            version_name="$version_name-p1"
+        fi
+
+        file_name="magento$([[ "${version_name:0:1}" == "2" ]] && \
+                echo "2")$([[ -n ${mg2_magento_sample_data} && "${version_name:0:1}" == "2" ]] && \
+                echo "-with-samples")-${version_name}.tar.gz"
+
+        temp_path="${mg2_global_dir}/cache/temp-${file_name}"
+        cached_path="${mg2_global_dir}/cache/${file_name}"
+
+        url="http://pubfiles.nexcess.net/magento/ce-packages/${file_name}"
+
+        if [[ ! -d "${mg2_global_dir}/cache" ]]
+        then
+            mkdir -p "${mg2_global_dir}/cache"
+        fi
+
+        rm -rf "${mg2_global_dir}"/cache/temp-* >/dev/null 2>&1
+
+        if [[ ! -f "${cached_path}" ]]
+        then
+            mg2_info_bold "\n[Downloading Magento sources]\n\n"
+
+            local curl_res=18
+
+            while [[ ${curl_res} -eq 18 ]]
+            do
+                curl -L -o "${temp_path}" -C - "$url"
+                curl_res=$?
+            done
+
+            if [[ ${curl_res} -ne 0 ]]
+            then
+                echo -ne "\n\n"
+                mg2_error_bold "An error occurred while downloading Magento sources. Check your network connection and retry with the \`mg2 init\` command.\n"
+                exit 1
+            fi
+        else
+            temp_path="${cached_path}"
+        fi
+
+        mg2_info_bold "\n[Extracting Magento sources]\n\n"
+        mg2_dots "Extracting sources from archive"
+        mg2_loading
+        if [[ -n ${MG2_CFG_MAGENTO_SRC} ]]
+        then
+            mkdir -p "${mg2_project_dir}/$MG2_CFG_MAGENTO_SRC"
+            tar -zxf "${temp_path}" -C "${mg2_project_dir}/$MG2_CFG_MAGENTO_SRC"
+            mg2_res=$?
+        else
+            tar -zxf "${temp_path}" -C "${mg2_project_dir}"
+            mg2_res=$?
+        fi
+        mg2_result ${mg2_res}
+    fi
+
+    mg2_mutagen_terminate php
+
+    mg2_info_bold "\n[Cleanup]\n\n"
+    mg2_dots "Cleanup before creating containers"
+    mg2_loading
+    mg2_local_project_down >/dev/null 2>&1 && \
+    [[ -f "${mg2_magento_db_import}" ]] || rm -rf \
+        "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php"
+    mg2_result 0
+
+    local service=($(mg2_local_list_services))
+
+    mg2_info_bold "\n[Creating docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in ${!service[@]}
+    do
+        mg2_print_service "${service[$i]}"
+        mg2_loading
+        mg2_local_project_up "${service[$i]}"
+        mg2_result $?
+    done
+
+    [[ "$mg2_os" == "darwin" ]] && mg2_push --all
+
+    if [[ -f "${mg2_magento_db_import}" ]]
+    then
+        mg2_db_import "${mg2_magento_db_import}" "init"
+        mg2_info_bold "\n[Installing Magento]\n\n"
+    else
+        mg2_info_bold "\n[Installing Magento]\n\n"
+
+        mg2_dots "Started Magento installation, it may take a while"
+        mg2_loading_install
+
+        mg2_magento --notty setup:install \
+                --db-host="db.${MG2_CFG_DOMAIN_NAME}" \
+                --db-name="${MG2_CFG_MYSQL_DATABASE}" \
+                --db-user="${MG2_CFG_MYSQL_USER}" \
+                --db-password="${MG2_CFG_MYSQL_PASSWORD}" \
+                --base-url="https://${MG2_CFG_DOMAIN_NAME}/" \
+                --admin-firstname="${MG2_CFG_ADMIN_FIRSTNAME}" \
+                --admin-lastname="${MG2_CFG_ADMIN_LASTNAME}" \
+                --admin-email="${MG2_CFG_ADMIN_EMAIL}" \
+                --admin-user="${MG2_CFG_ADMIN_USERNAME}" \
+                --admin-password="${MG2_CFG_ADMIN_PASSWORD}" \
+                --backend-frontname="${MG2_CFG_ADMIN_URL}" \
+                --language="${MG2_CFG_LOCALE}" \
+                --currency="${MG2_CFG_CURRENCY}" \
+                --timezone="${MG2_CFG_TIMEZONE}" \
+                --use-rewrites=1 >"${mg2_log}" 2>&1 && \
+                sleep 2 && \
+        mg2_magento --notty config:set trans_email/ident_general/email \
+            "owner@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty config:set trans_email/ident_sales/email \
+            "sales@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty config:set trans_email/ident_support/email \
+            "support@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty config:set trans_email/ident_custom1/email \
+            "custom1@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty config:set trans_email/ident_custom2/email \
+            "custom2@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty config:set contact/email/recipient_email \
+            "hello@$MG2_CFG_DOMAIN_NAME" >"${mg2_log}" 2>&1 >"${mg2_log}" 2>&1
+        mg2_result $?
+    fi
+
+    if [[ -n ${mg2_composer_public_key} && -n ${mg2_composer_private_key} ]]
+    then
+        mg2_dots "Configuring composer authentication for docker containers"
+        mg2_loading
+        mg2_cli --notty composer config http-basic.repo.magento.com \
+            ${mg2_composer_public_key} ${mg2_composer_private_key} >"${mg2_log}" 2>&1
+        mg2_result $?
+    fi
+
+    mg2_dots "Turning on developer mode"
+    mg2_loading
+    mg2_magento --notty deploy:mode:set developer >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Configuring Nginx"
+    mg2_loading
+    (
+        sed -e 's/fastcgi_backend/$fastcgi_backend/g' \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/nginx.conf.sample" > \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/nginx.conf" && \
+        mg2_docker_cp "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/nginx.conf" \
+            "${MG2_CFG_DOMAIN_NAME}__php":/var/www/html/nginx.conf && \
+        docker-compose exec -T php chown -R app:app nginx.conf && \
+        mg2_local_container_restart nginx
+    ) >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Configuring Redis for caching"
+    mg2_loading
+    mg2_redis_configure
+    mg2_result $?
+
+    if [[ -n ${MG2_CFG_ELASTICSEARCH} ]]
+    then
+        mg2_dots "Configuring Elasticsearch"
+        mg2_loading
+        mg2_elasticsearch_configure
+        mg2_result $?
+    fi
+
+    if [[ -n ${MG2_CFG_VARNISH} ]]
+    then
+        mg2_dots "Configuring Varnish"
+        mg2_loading
+        mg2_varnish_configure
+        mg2_result $?
+    fi
+
+    if [[ -n ${MG2_CFG_RABBITMQ} ]]
+    then
+        mg2_dots "Configuring RabbitMQ"
+        mg2_loading
+        mg2_rabbitmq_configure
+        mg2_result $?
+    fi
+
+    [[ -f "${mg2_magento_db_import}" ]] && mg2_domain_name
+
+    if [[ "${MG2_CFG_MAGENTO:0:1}" == "2" ]]
+    then
+        mg2_dots "Forcing deploy of static content"
+        mg2_loading
+        mg2_magento --notty setup:static-content:deploy -f >"${mg2_log}" 2>&1
+        mg2_result $?
+
+        mg2_dots "Installing Magento node modules dependencies"
+        mg2_loading
+        (
+            yes | cp -rf "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/package.json.sample" \
+                "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/package.json" && \
+            mg2_docker_cp "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/package.json" \
+                "${MG2_CFG_DOMAIN_NAME}__php":/var/www/html/package.json && \
+            docker-compose exec -T php chown -R app:app package.json && \
+            mg2_npm install
+        ) >"${mg2_log}" 2>&1
+        mg2_result $?
+
+        mg2_dots "Clearing the cache for good measure"
+        mg2_loading
+        (
+            mg2_magento --notty cache:flush && \
+            mg2_magento --notty cache:enable
+        ) >"${mg2_log}" 2>&1
+        mg2_result $?
+    fi
+
+    mg2_sign ${MG2_CFG_DOMAIN_NAME}
+
+    if [[ ! -f "${cached_path}" && -f ${temp_path} ]]
+    then
+        mv "${temp_path}" "${cached_path}" >/dev/null 2>&1
+    fi
+
+    if [[ "$mg2_os" == "darwin" ]]
+    then
+        mg2_info_bold "\n[Mutagen sync]\n\n"
+        mg2_dots "Creating sync sessions"
+        mg2_loading
+        mg2_docker_cp "${MG2_CFG_DOMAIN_NAME}__php":/var/www/html/app/etc/. \
+            "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/" >/dev/null 2>&1 && \
+        mg2_sync stop >/dev/null 2>&1 && \
+        mg2_sync start >/dev/null 2>&1 && \
+        sleep 15
+        mg2_result $?
+    fi
+
+    mg2_info_bold "\n[Installation finished]\n\n"
+
+    mg2_msg "The project successfully initialized with mg121ecommerce toolset!\n"
+    mg2_msg "Run \`mg2 status\` command to get project status information.\n"
+    mg2_msg "Magento instance is now available at https://${MG2_CFG_DOMAIN_NAME}\n\n"
+}
+
+mg2_init_check_version() {
+    local name=$1 value=$2 versions=()
+
+    shift
+    shift
+
+    versions+=("$@")
+
+    if ! mg2_in_array ${value} ${versions[@]}
+    then
+        mg2_error_bold "Invalid $name version, supported versions:\n"
+        mg2_error "$(
+            for i in "${!versions[@]}"
+            do
+                echo -en "${versions[$i]}\t\t"
+                (( ($i + 1) % 5 == 0 )) && echo -en "\n"
+            done)\n"
+        exit 1
+    fi
+}
+
+mg2_init_detect_magento() {
+    local exists \
+          version \
+          admin_url
+
+    if [[ -f "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/pub/index.php" && \
+          -f "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/composer.json" ]]
+    then
+        mg2_dots "Checking Magento source files"
+        mg2_loading && mg2_result 0
+
+        version=$(grep 'version' "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/composer.json" | cut -c 17- | rev | cut -c 3- | rev 2>/dev/null)
+
+        if [[ -n ${version} ]]
+        then
+            mg2_msg "\nDetected Magento: "
+            mg2_info_bold "v$version\n"
+            MG2_CFG_MAGENTO="$version"
+
+            if [[ -f "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php" ]]
+            then
+                admin_url=$(grep -A1 "'backend' => \[" "${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}/app/etc/env.php" | grep 'frontName' | cut -c 25- | rev | cut -c 2- | rev)
+
+                if [[ -n ${admin_url} ]]
+                then
+                    mg2_msg "Admin url path: "
+                    mg2_info_bold "$admin_url\n"
+                    MG2_CFG_ADMIN_URL="$admin_url"
+                fi
+            fi
+
+            return 0
+        else
+            mg2_dots "Magento version is not detected, proceeding configuration"
+            mg2_loading && mg2_result 0
+        fi
+    fi
+
+    return 1
+}
+
+mg2_init_composer_auth() {
+    if [[ "${MG2_CFG_MAGENTO:0:1}" == "2" ]]
+    then
+        mg2_info_bold "\n[Configure Composer auth]\n\n"
+
+        mg2_loading
+
+        if hash composer >/dev/null 2>&1
+        then
+            mg2_composer_public_key="$(composer config -ng http-basic.repo.magento.com.username 2>/dev/null || true)"
+            mg2_composer_private_key="$(composer config -ng http-basic.repo.magento.com.password 2>/dev/null || true)"
+        fi
+
+        mg2_result 0
+        mg2_erase_prev_lines 1
+        mg2_msg "Authentication is required for Composer repository repo.magento.com\n\n"
+
+        if [[ -n ${mg2_composer_public_key} && -n ${mg2_composer_private_key} ]]
+        then
+            mg2_ask_bool "Use authentication information from the current composer config?"
+        else
+            mg2_res=
+        fi
+
+        if [[ -z ${mg2_res} || -z ${mg2_composer_public_key} || -z ${mg2_composer_private_key} ]]
+        then
+            mg2_erase_prev_lines 1
+            mg2_msg "Provide authentication keys.\n\n"
+
+            mg2_ask_text "Public key:" \
+                     "" \
+                     "Public key cannot be empty!\n" \
+                     "" \
+                     mg2_validate_not_empty
+
+            mg2_composer_public_key="$mg2_res"
+
+            mg2_ask_text "Private key:" \
+                     "" \
+                     "Private key cannot be empty!\n" \
+                     "" \
+                     mg2_validate_not_empty
+
+            mg2_composer_private_key="$mg2_res"
+
+            if [[ -z ${mg2_res} ]] && hash composer >/dev/null 2>&1
+            then
+                mg2_ask_bool "Update the current composer config with provided authentication information?"
+
+                [[ -n ${mg2_res} ]] && composer global config http-basic.repo.magento.com \
+                    "$mg2_composer_public_key" "$mg2_composer_private_key" >/dev/null 2>&1
+            fi
+        fi
+    fi
+}
+
+mg2_init_error() {
+    mg2_error_bold "Unknown argument \`$1\`. Run \`mg2 init --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_init_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Initializes Magento Docker project in the current directory. If no arguments
+  defined, interactive setup mode will be started. If at least one argument
+  is defined, automated setup will be started. All undefined parameters will
+  be set with default values.
+
+\033[1;33mUsage:\033[0m
+  mg2 init [parameters...] [flags...]
+
+\033[1;33mParameters:\033[0m
+  --domain <magento.test>           Set domain name with .test tld to use for
+                                    the project.
+  --nginx-version <1.17>            Set Nginx version.
+  --php-version <7.3>               Set PHP version.
+  --mariadb-version <10.3>          Set MariaDB version.
+  --redis-version <5.0>             Set Redis version.
+  --varnish-version <5.2>           Set Varnish version, applicable only when
+                                    --varnish option is present.
+  --elasticsearch-version <6.8>     Set Elasticsearch version. Applicable only
+                                    when --elasticsearch option is present.
+  --rabbitmq-version <3.7>          Set RabbitMQ version. Applicable only when
+                                    --rabbitmq option is present.
+  --magento-version <2.3.5>         Set Magento version to install. Applicable
+                                    only for clean installs.
+  --magento-admin-url <admin>       Set Magento admin url path. Applicable only
+                                    for clean installs.
+  --magento-sub-dir <admin>         Set sub-directory name to use for Magento
+                                    installation. Applicable only for clean
+                                    installs.
+  --magento-import-db <file>        Set path to plain sql or gzipped database
+                                    dump file. Applicable only when running
+                                    command within existing Magento project
+                                    directory.
+
+\033[1;33mFlags:\033[0m
+  --elasticsearch                   Use Elasticsearch search engine.
+  --phpmyadmin                      Use phpMyAdmin database manager.
+  --rabbitmq                        Use RabbitMQ message-broker.
+  --varnish                         Use Varnish cache.
+  --magento-sample-data             Install Magento with sample data included,
+                                    applicable only for clean installs.
+  --help                            Display this information.
+"
+    exit 0
+}
+
+mg2_local() {
+    case "$1" in
+        add)
+            shift
+            mg2_local_add "$@"
+        ;;
+        remove)
+            shift
+            mg2_local_remove "$@"
+        ;;
+        *)
+            mg2_in_array "--help" $@ && mg2_help
+
+            case "$1" in
+                down)
+                    shift
+                    mg2_local_down
+                ;;
+                info|status)
+                    mg2_local_info
+                ;;
+                update)
+                    shift
+                    mg2_local_update
+                ;;
+                *)
+                    local mg2_local_command=
+                    local mg2_local_service=()
+                    local mg2_local_services=($(mg2_local_list_services))
+
+                    while (("$#"))
+                    do
+                        case "$1" in
+                            up|start|restart|stop)
+                                mg2_local_command="$1"
+                                shift
+                            ;;
+                            nginx|php|xdebug|db|redis|varnish|elasticsearch|phpmyadmin|rabbitmq)
+                                if ! [[ "$1" == "varnish" && -z ${MG2_CFG_VARNISH} || \
+                                        "$1" == "elasticsearch" && -z ${MG2_CFG_ELASTICSEARCH} || \
+                                        "$1" == "phpmyadmin" && -z ${MG2_CFG_PHPMYADMIN} || \
+                                        "$1" == "rabbitmq" && -z ${MG2_CFG_RABBITMQ} ]]
+                                then
+                                    mg2_local_service+=("$1")
+                                fi
+                                shift
+                            ;;
+                            *)
+                                if mg2_in_array "$1" ${mg2_local_services[@]}
+                                then
+                                    mg2_local_service+=("$1")
+                                    shift
+                                else
+                                    mg2_local_error "$1" "$mg2_local_command"
+                                fi
+                            ;;
+                        esac
+                    done
+
+                    if [[ -n ${mg2_local_command} ]]
+                    then
+                        if ! (("${#mg2_local_service[@]}"))
+                        then
+                            mg2_local_service=("${mg2_local_services[@]}")
+                        fi
+
+                        case ${mg2_local_command} in
+                            up)
+                                mg2_local_up "${mg2_local_service[@]}"
+                            ;;
+                            start)
+                                mg2_local_start "${mg2_local_service[@]}"
+                            ;;
+                            restart)
+                                mg2_local_restart "${mg2_local_service[@]}"
+                            ;;
+                            stop)
+                                mg2_local_stop "${mg2_local_service[@]}"
+                            ;;
+                        esac
+                    fi
+                ;;
+            esac
+        ;;
+    esac
+}
+
+mg2_local_add_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Adds optional service or extra domain to the project.
+
+\033[1;33mUsage:\033[0m
+  mg2 add service <service>
+  mg2 add domain <domain>
+  mg2 add --help
+
+\033[1;33mServices:\033[0m
+  elasticsearch     Elasticsearch service.
+  phpmyadmin        phpMyAdmin service.
+  rabbitmq          RabbitMQ service.
+  varnish           Varnish service.
+
+\033[1;33mFlags:\033[0m
+  --help            Displays this information.
+"
+    exit 0
+}
+
+mg2_local_add() {
+    mg2_in_array "--help" $@ && mg2_local_add_help
+
+    case "$1" in
+        service)
+            shift
+            mg2_local_add_service "$@"
+        ;;
+        domain)
+            shift
+            mg2_local_add_domain "$@"
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_local_add_help
+            else
+                mg2_local_error "$*" "add"
+            fi
+        ;;
+    esac
+}
+
+mg2_local_add_service() {
+    case "$@" in
+        varnish)
+            mg2_ask_bool "\nAdd Varnish service?"
+            MG2_CFG_VARNISH=${mg2_res}
+
+            if [[ -n ${MG2_CFG_VARNISH} ]]
+            then
+                mg2_set_opt_version "Varnish" "${mg2_varnish_versions[@]}"
+
+                mg2_save_project_env
+
+                mg2_local up varnish nginx
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Configuring Varnish"
+                mg2_loading
+                mg2_varnish_configure
+                mg2_result $?
+            fi
+        ;;
+        elasticsearch)
+            mg2_ask_bool "\nAdd Elasticsearch service?"
+            MG2_CFG_ELASTICSEARCH=${mg2_res}
+
+            if [[ -n ${MG2_CFG_ELASTICSEARCH} ]]
+            then
+                mg2_set_opt_version "Elasticsearch" "${mg2_elasticsearch_versions[@]}"
+
+                mg2_save_project_env
+
+                mg2_local up elasticsearch
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Configuring Elasticsearch"
+                mg2_loading
+                mg2_elasticsearch_configure
+                mg2_result $?
+            fi
+        ;;
+        rabbitmq)
+            mg2_ask_bool "\nAdd RabbitMQ service?"
+            MG2_CFG_RABBITMQ=${mg2_res}
+
+            if [[ -n ${MG2_CFG_RABBITMQ} ]]
+            then
+                mg2_set_opt_version "RabbitMQ" "${mg2_rabbitmq_versions[@]}"
+
+                mg2_save_project_env
+
+                mg2_local up rabbitmq
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Configuring RabbitMQ"
+                mg2_loading
+                mg2_rabbitmq_configure
+                mg2_result $?
+            fi
+        ;;
+        phpmyadmin)
+            mg2_ask_bool "\nAdd phpMyAdmin service?"
+            MG2_CFG_PHPMYADMIN=${mg2_res}
+
+            if [[ -n ${MG2_CFG_PHPMYADMIN} ]]
+            then
+                mg2_save_project_env
+
+                mg2_local up phpmyadmin
+            fi
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_local_add_help
+            else
+                mg2_local_error "$*" "add"
+            fi
+        ;;
+    esac
+}
+
+mg2_local_add_domain() {
+    local domain="$@"
+
+    if ! mg2_validate_domain "$domain"
+    then
+        mg2_error "Invalid domain name: \`$domain\`!\nOnly valid domain names with \`.test\` tld are supported!\n"
+        exit 1
+    fi
+
+    if [[ "$MG2_CFG_DOMAIN_NAMES" != *"\`$domain\`"* ]]
+    then
+        MG2_CFG_DOMAIN_NAMES="$MG2_CFG_DOMAIN_NAMES,\`$domain\`"
+
+        mg2_sign $domain
+
+        mg2_save_project_env
+
+        mg2_local_up $([[ -n ${MG2_CFG_VARNISH} ]] && echo "varnish" || echo "nginx")
+    else
+        mg2_error "Domain name \`$domain\` already exists in the extra domains list!\n"
+        exit 1
+    fi
+}
+
+mg2_local_remove_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Removes optional service or extra domain from the project.
+
+\033[1;33mUsage:\033[0m
+  mg2 remove service <service> [--help]
+  mg2 remove domain <domain> [--help]
+
+\033[1;33mServices:\033[0m
+  elasticsearch     Elasticsearch service.
+  phpmyadmin        phpMyAdmin service.
+  rabbitmq          RabbitMQ service.
+  varnish           Varnish service.
+
+\033[1;33mFlags:\033[0m
+  --help            Displays this information.
+"
+    exit 0
+}
+
+mg2_local_remove() {
+    mg2_in_array "--help" $@ && mg2_local_remove_help
+
+    case "$1" in
+        service)
+            shift
+            mg2_local_remove_service "$@"
+        ;;
+        domain)
+            shift
+            mg2_local_remove_domain "$@"
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_local_remove_help
+            else
+                mg2_local_error "$*" "remove"
+            fi
+        ;;
+    esac
+}
+
+mg2_local_remove_service() {
+    local service=
+
+    mg2_in_array "--help" $@ && mg2_local_remove_help
+
+    case "$@" in
+        varnish)
+            mg2_ask_bool "\nRemove Varnish service?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Resetting Varnish configuration"
+                mg2_loading
+                mg2_varnish_reset
+                mg2_result $?
+
+                MG2_CFG_VARNISH=
+            fi
+        ;;
+        elasticsearch)
+            mg2_ask_bool "\nRemove Elasticsearch service?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Resetting Elasticsearch configuration"
+                mg2_loading
+                mg2_elasticsearch_reset
+                mg2_result $?
+
+                MG2_CFG_ELASTICSEARCH=
+            fi
+        ;;
+        rabbitmq)
+            mg2_ask_bool "\nRemove RabbitMQ service?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+
+                mg2_info_bold "\n[Configuring services]\n\n"
+
+                mg2_dots "Resetting RabbitMQ configuration"
+                mg2_loading
+                mg2_rabbitmq_reset
+                mg2_result $?
+
+                MG2_CFG_RABBITMQ=
+            fi
+        ;;
+        phpmyadmin)
+            mg2_ask_bool "\nRemove phpMyAdmin service?"
+
+            if [[ -n ${mg2_res} ]]
+            then
+                service="$1"
+
+                MG2_CFG_PHPMYADMIN=
+            fi
+        ;;
+        *)
+            if [[ "$@" == "" ]]
+            then
+                mg2_local_remove_help
+            else
+                mg2_local_error "$*" "remove"
+            fi
+        ;;
+    esac
+
+    if [[ -n ${service} ]]
+    then
+        mg2_info_bold "\n[Removing docker container]\n\n"
+        mg2_print_service "$service"
+        mg2_loading
+        mg2_local_container_remove "$service"
+        mg2_result $?
+
+        mg2_save_project_env
+
+        if [[ "$service" == "varnish" ]]
+        then
+            mg2_local up nginx
+        fi
+    fi
+}
+
+mg2_local_remove_domain() {
+    local domain="$@"
+
+    if ! mg2_validate_domain "$domain"
+    then
+        mg2_error "Invalid domain name: \`$domain\`!\nOnly valid domain names with \`.test\` tld are supported!\n"
+        exit 1
+    fi
+
+    if [[ "$MG2_CFG_DOMAIN_NAMES" == *"\`$domain\`"* ]]
+    then
+        MG2_CFG_DOMAIN_NAMES=${MG2_CFG_DOMAIN_NAMES//,\`$domain\`/}
+
+        mg2_save_project_env
+
+        mg2_local_up $([[ -n ${MG2_CFG_VARNISH} ]] && echo "varnish" || echo "nginx")
+    else
+        mg2_error "Domain name \`$domain\` was not found in the extra domains list!\n"
+        exit 1
+    fi
+}
+
+mg2_local_update() {
+    mg2_ask_bool "\nUpdate project docker configuration to latest?"
+
+    if [[ -z ${mg2_res} ]]
+    then
+        exit 0
+    fi
+
+    mg2_info_bold "\n[Updating]\n\n"
+    mg2_dots "Updating project docker configuration"
+    mg2_loading
+    mkdir -p "${mg2_project_dir}/.mg2/mutagen" "${mg2_project_dir}/.mg2/docker" \
+         "${mg2_project_dir}/.mg2/mysql" >"${mg2_log}" 2>&1 && \
+    yes | cp -rf "${mg2_global_dir}"/local/docker/* "${mg2_project_dir}/.mg2/docker/" >"${mg2_log}" 2>&1 && \
+    yes | cp -rf "${mg2_global_dir}/local/mutagen/mutagen.yml" \
+        "${mg2_project_dir}/.mg2/mutagen/mutagen.yml" >"${mg2_log}" 2>&1 && \
+    yes | cp -rf "${mg2_global_dir}/local/mysql/custom.cnf" "${mg2_project_dir}/.mg2/mysql/custom.cnf" && \
+    rm -rf "${mg2_project_dir}/.mg2/mutagen/mutagen.yml.lock" >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Updating docker images"
+    mg2_loading
+    docker-compose pull --ignore-pull-failures --include-deps >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_local up
+}
+
+mg2_local_container_exists() {
+    docker-compose ps --quiet --all "$1" >/dev/null 2>&1
+
+    return $?
+}
+
+mg2_local_container_inactive() {
+    docker-compose ps "$1" | grep 'Exit' >/dev/null 2>&1
+
+    return $?
+}
+
+mg2_local_container_start() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        docker-compose start "$service" >"${mg2_log}" 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_local_container_restart() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        docker-compose restart "$service" >"${mg2_log}" 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_local_container_stop() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        docker-compose stop "$service" >"${mg2_log}" 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_local_container_remove() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        local project="${MG2_CFG_DOMAIN_NAME/.test/}"
+
+        local volumes="$(docker volume ls \
+            --filter "label=com.docker.compose.project=$project" \
+            -q | grep "${project}_${service}_data")"
+
+        docker-compose rm --force --stop -v "${service}" >"${mg2_log}" 2>&1 && \
+        (
+            [[ -n "${volumes}" ]] && docker volume rm --force "${volumes}" >"${mg2_log}" 2>&1 || true
+        )
+
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_local_info() {
+    local project="${MG2_CFG_DOMAIN_NAME/.test/}"
+    local spaces="$(printf "%-${#project}s" " ")"
+    local containers="$(docker ps \
+            --filter "label=com.docker.compose.project=${project}" \
+            --format 'table {{.ID}}  {{.Names}}\t{{.Image}}\t{{.Status}}' -a | \
+            sed "s/${project}.test__//; s/${spaces}       IMAGE/IMAGE/")\n"
+
+    mg2_info "\nProject: "
+    mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/&.test/')\n"
+    if echo "$containers" | grep -q "phpmyadmin"
+    then
+        mg2_info "phpMyAdmin: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/pma.&.test/')\n"
+    fi
+    if echo "$containers" | grep -q "elasticsearch"
+    then
+        mg2_info "Elasticsearch: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/elasticsearch.&.test/')\n"
+    fi
+    if echo "$containers" | grep -q "rabbitmq"
+    then
+        mg2_info "RabbitMQ: "
+        mg2_info_bold "$(echo "${project}" | sed 's/.*/https:\/\/rabbitmq.&.test/')\n"
+    fi
+    mg2_info "Path: "
+    mg2_info_bold "$(docker inspect --format='{{index .Config.Labels "mg2.project.path"}}' \
+        "${project}.test__php")\n\n"
+    mg2_msg "$containers"
+
+    exit 0
+}
+
+mg2_local_project_up() {
+    local service="$1"
+
+    if [[ -n ${service} ]]
+    then
+        yes | docker-compose up --detach --force-recreate --no-color --no-deps "$service" >"${mg2_log}" 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+mg2_local_list_services() {
+    docker-compose ps --services --all
+    return $?
+}
+
+mg2_local_project_down() {
+    local project="${MG2_CFG_DOMAIN_NAME/.test/}"
+
+    local volumes="$(docker volume ls \
+        --filter "label=com.docker.compose.project=$project" \
+        -q)"
+
+    local networks="$(docker network ls \
+        --filter "label=com.docker.compose.project=$project" \
+        -q)"
+
+    docker-compose rm --force --stop -v >"${mg2_log}" 2>&1 || true && \
+    (
+        [[ -n ${volumes} ]] && docker volume rm --force ${volumes} >"${mg2_log}" 2>&1 || true
+    ) && \
+    (
+        [[ -n ${networks} ]] && docker network rm ${networks} >"${mg2_log}" 2>&1 || true
+    )
+
+    return $?
+}
+
+mg2_local_project_check_dir() {
+    if [[ ! -f "${mg2_project_dir}/.env" ]]
+    then
+        if [[ -f "${mg2_project_dir}/.mg2/docker/.env" ]] && \
+           mv "${mg2_project_dir}/.mg2/docker/.env" "${mg2_project_dir}/.env" >/dev/null 2>&1
+        then
+            mg2_load_env
+            mg2_save_project_env
+        else
+            mg2_error "This command intended to be used within the project directory!\nChange the current working directory to project root or to any project's sub-directory.\n"
+            exit 1
+        fi
+    fi
+}
+
+mg2_local_project_check() {
+    mg2_local_project_check_dir
+
+    if ! mg2_local_container_exists php
+    then
+        mg2_error "This command intended to be used with the initialized projects only!\nTo initialize a new project in the current directory, run \`mg2 init\` command.\n"
+        exit 1
+    fi
+}
+
+mg2_local_active_project_check() {
+    mg2_local_project_check_dir
+
+    if ! mg2_local_container_exists php
+    then
+        mg2_error "This command intended to be used with the initialized projects only!\nTo initialize a new project in the current directory, run \`mg2 init\` command.\n"
+        exit 1
+    elif mg2_local_container_inactive php
+    then
+        mg2_local start
+        echo
+    fi
+}
+
+mg2_local_error() {
+    mg2_error "Unknown argument \`$1\`. Run \`mg2$([[ "$2" != "" ]] && \
+        echo " $2") --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_print_service() {
+    case "$1" in
+        portainer)
+            mg2_dots "Portainer"
+        ;;
+        mailhog)
+            mg2_dots "Mailhog"
+        ;;
+        dnsmasq)
+            mg2_dots "Dnsmasq"
+        ;;
+        traefik)
+            mg2_dots "Traefik"
+        ;;
+        mg121ecommerce)
+            mg2_dots "mg121ecommerce"
+        ;;
+        nginx)
+            mg2_dots "Nginx"
+        ;;
+        php)
+            mg2_dots "PHP"
+        ;;
+        xdebug)
+            mg2_dots "Xdebug"
+        ;;
+        db)
+            mg2_dots "Db"
+        ;;
+        redis)
+            mg2_dots "Redis"
+        ;;
+        varnish)
+            mg2_dots "Varnish"
+        ;;
+        elasticsearch)
+            mg2_dots "Elasticsearch"
+        ;;
+        phpmyadmin)
+            mg2_dots "phpMyAdmin"
+        ;;
+        rabbitmq)
+            mg2_dots "RabbitMQ"
+        ;;
+        *)
+            local service=$(echo "$1" | awk '{ print toupper( substr( $0, 1, 1 ) ) substr( $0, 2 ); }')
+            mg2_dots "$service"
+        ;;
+    esac
+}
+
+mg2_local_start() {
+    local service=("$@")
+
+    mg2_info_bold "\n[Starting docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service "${service[$i]}"
+        mg2_loading
+        mg2_local_container_start "${service[$i]}"
+        mg2_result $?
+    done
+
+    mg2_mutagen_create ${service[@]}
+}
+
+mg2_local_restart() {
+    local service=("$@")
+
+    mg2_info_bold "\n[Restarting docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service "${service[$i]}"
+        mg2_loading
+        mg2_local_container_restart "${service[$i]}"
+        mg2_result $?
+    done
+
+    mg2_mutagen_create ${service[@]}
+}
+
+mg2_local_stop() {
+    local service=("$@")
+
+    mg2_mutagen_terminate ${service[@]}
+
+    mg2_info_bold "\n[Stopping docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service "${service[$i]}"
+        mg2_loading
+        mg2_local_container_stop "${service[$i]}"
+        mg2_result $?
+    done
+}
+
+mg2_local_up() {
+    local service=($@)
+
+    mg2_info_bold "\n[Creating docker container$( (("${#service[@]}" > 1)) && echo "s" )]\n\n"
+
+    for i in "${!service[@]}"
+    do
+        mg2_print_service "${service[$i]}"
+        mg2_loading
+        mg2_local_project_up "${service[$i]}"
+        mg2_result $?
+    done
+
+    mg2_mutagen_create ${service[@]}
+}
+
+mg2_local_down() {
+    mg2_ask_bool "\nRemove project docker containers and persistent volumes?"
+
+    if [[ -z ${mg2_res} ]]
+    then
+        exit 0
+    fi
+
+    mg2_mutagen_terminate php
+
+    mg2_info_bold "\n[Uninstalling]\n\n"
+    mg2_dots "Removing project docker containers, volumes and network"
+    mg2_loading
+    mg2_local_project_down
+    mg2_result $?
+}
+
+mg2_magento() {
+    local notty \
+          service="php" \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            --debug)
+                service="xdebug"
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} ${service} php bin/magento "${args[@]}"
+}
+
+mg2_magerun() {
+    local notty \
+          args=()
+
+    while (("$#"))
+    do
+        case "$1" in
+            --notty)
+                notty=1
+                shift
+            ;;
+            *)
+                args+=( "$1" )
+                shift
+            ;;
+        esac
+    done
+
+    docker-compose exec -u app ${notty:+-T} php \
+        "n98-magerun$([[ "${MG2_CFG_MAGENTO:0:1}" == "2" ]] && echo "2")" "${args[@]}"
+}
+
+mg2_mutagen() {
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+        mg2_help
+    fi
+
+    export MUTAGEN_DATA_DIRECTORY="${mg2_global_dir}/mutagen"
+    "${MUTAGEN_DATA_DIRECTORY}/mutagen" daemon start
+    "${MUTAGEN_DATA_DIRECTORY}/mutagen" $@
+}
+
+mg2_mutagen_create() {
+    if [[ "$mg2_os" == "darwin" ]] && mg2_in_array php $@
+    then
+        mg2_info_bold "\n[Mutagen sync]\n\n"
+        mg2_dots "Creating sync sessions"
+        mg2_loading
+        mg2_sync stop >/dev/null 2>&1 && \
+        mg2_sync start >/dev/null 2>&1 && \
+        mg2_result $?
+    fi
+}
+
+mg2_mutagen_terminate() {
+    if [[ "$mg2_os" == "darwin" ]] && mg2_in_array php $@
+    then
+        mg2_info_bold "\n[Mutagen sync]\n\n"
+        mg2_dots "Terminating sync sessions"
+        mg2_loading
+        mg2_sync stop >/dev/null 2>&1
+        mg2_result $?
+    fi
+}
+
+mg2_pull_exec() {
+    local sub_dir=${MG2_CFG_MAGENTO_SRC:-} \
+          container="${MG2_CFG_DOMAIN_NAME}__php" \
+          source_path error res
+
+    mg2_info_bold "\n[Pull]\n\n"
+
+    if [[ -z "$1" ]]
+    then
+        mg2_dots "Pulling files from php docker container"
+        mg2_loading
+        mg2_sync pause >/dev/null 2>&1 && \
+        docker cp "$container":/var/www/html/. "${mg2_project_dir}${sub_dir:+/${sub_dir}}/" >"${mg2_log}" 2>&1 && \
+        mg2_sync resume >/dev/null 2>&1
+        res=$?
+        mg2_result ${res}
+        return ${res}
+    else
+        source_path="${1%%+(/)}"
+        dest_path="${mg2_project_dir}${sub_dir:+/${sub_dir}}/${source_path}"
+        mg2_info "$dest_path "
+        mg2_info_bold "←\n\n"
+
+        if mg2_cli --notty bash -c "[[ -d "/var/www/html/${source_path}" ]]" >"${mg2_log}" 2>&1
+        then
+            mg2_dots "Pulling directory from php docker container"
+            mg2_loading
+            mg2_sync pause >/dev/null 2>&1 && \
+            docker cp "$container":"/var/www/html/${source_path}"/. "${dest_path}" >"${mg2_log}" 2>&1 && \
+            mg2_sync resume >/dev/null 2>&1
+            res=$?
+            mg2_result ${res}
+            return ${res}
+        elif mg2_cli --notty bash -c "[[ -f "/var/www/html/${source_path}" ]]" >"${mg2_log}" 2>&1
+        then
+            mg2_dots "Pulling file from php docker container"
+            mg2_loading
+            mg2_sync pause >/dev/null 2>&1 && \
+            docker cp "$container":"/var/www/html/${source_path}" "$(dirname "${dest_path}")" >"${mg2_log}" 2>&1 && \
+            mg2_sync resume >/dev/null 2>&1
+            res=$?
+            mg2_result ${res}
+            return ${res}
+        else
+            error="Specified path does not exist on php docker container: \n$source_path\n\n"
+        fi
+    fi
+
+    if [[ -n ${error} ]]
+    then
+        mg2_error "$error"
+    fi
+
+    return 1
+}
+
+mg2_pull_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Pull file or directory from php docker container to Magento src root. To
+  pull multiple files or directories, specify paths as list divided by spaces.
+  To pull all files, use --all flag. e.g. \`mg2 pull -all\`. Specified
+  paths must be relative to docker container /var/www/html directory.
+
+\033[1;33mUsage:\033[0m
+  mg2 pull [<path1> [<path2>...]] [flags...]
+
+\033[1;33mFlags:\033[0m
+  --all     Pull all files from php docker container to Magento src root.
+  --help    Display this information.
+"
+    exit 0
+}
+
+mg2_pull() {
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+        mg2_help
+    fi
+
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_pull_help
+
+        if mg2_in_array "--all" $@
+        then
+            mg2_pull_exec
+        else
+            while (("$#")); do
+                case "$1" in
+                    *)
+                        mg2_pull_exec "$1"
+                    ;;
+                esac
+                shift
+            done
+        fi
+    else
+        mg2_pull_help
+    fi
+}
+
+mg2_push_exec() {
+    local sub_dir=${MG2_CFG_MAGENTO_SRC:-} \
+          container="${MG2_CFG_DOMAIN_NAME}__php" \
+          source_path error res
+
+    mg2_info_bold "\n[Push]\n\n"
+
+    if [[ -z "$1" ]]
+    then
+        mg2_dots "Pushing all files to php docker container"
+        mg2_loading
+        mg2_sync pause >/dev/null 2>&1 && \
+        docker cp "${mg2_project_dir}${sub_dir:+/${sub_dir}}"/. "$container":/var/www/html/ >"${mg2_log}" 2>&1 && \
+        docker-compose exec -T php chown -R app:app /var/www/ >"${mg2_log}" 2>&1 && \
+        docker-compose exec -T php chmod u+x ./bin/magento >"${mg2_log}" 2>&1 && \
+        (
+            docker-compose exec -T php chmod u+w -R ./var ./vendor ./pub/static ./pub/media ./app/etc || true
+        ) >/dev/null 2>&1 && \
+        mg2_sync resume >/dev/null 2>&1
+        res=$?
+        mg2_result ${res}
+        return ${res}
+    else
+        dest_path="${1%%+(/)}"
+        source_path="${mg2_project_dir}${sub_dir:+/${sub_dir}}/${dest_path}"
+
+        if [[ -d "${source_path}" || -f "${source_path}" ]]
+        then
+            mg2_info "$source_path "
+            mg2_info_bold "→\n\n"
+
+            if [[ -d "${source_path}" ]]
+            then
+                mg2_dots "Pushing directory to php docker container"
+                mg2_loading
+                mg2_sync pause >"${mg2_log}" 2>&1 && \
+                docker cp "${source_path}"/. "$container":"/var/www/html/${dest_path}" >"${mg2_log}" 2>&1 && \
+                docker-compose exec -T php chown -R app:app "${dest_path}" >"${mg2_log}" 2>&1 && \
+                case "$dest_path" in
+                    var|vendor|pub/static|pub/media|app/etc|var/*|vendor/*|pub/static/*|pub/media/*|app/etc/*)
+                        docker-compose exec -T php chmod u+w -R ./"${dest_path}" >"${mg2_log}" 2>&1
+                    ;;
+                    *)
+                        true
+                    ;;
+                esac && \
+                mg2_sync resume >"${mg2_log}" 2>&1
+            else
+                mg2_dots "Pushing file to php docker container"
+                mg2_loading
+                mg2_sync pause >"${mg2_log}" 2>&1 && \
+                docker cp "${source_path}" "$container":/var/www/html/"$(dirname "${dest_path}")" >"${mg2_log}" 2>&1 && \
+                docker-compose exec -T php chown -R app:app "${dest_path}" >"${mg2_log}" 2>&1 && \
+                case "$dest_path" in
+                    bin/magento)
+                        docker-compose exec -T php chmod u+x ./"${source_path}" >"${mg2_log}" 2>&1
+                    ;;
+                    var/*|vendor/*|pub/static/*|pub/media/*|app/etc/*)
+                        docker-compose exec -T php chmod u+w -R ./"${dest_path}" >"${mg2_log}" 2>&1
+                    ;;
+                    *)
+                        true
+                    ;;
+                esac && \
+                mg2_sync resume >"${mg2_log}" 2>&1
+            fi
+
+            res=$?
+            mg2_result ${res}
+            return ${res}
+        else
+            error="Specified path does not exist on host machine: \n$source_path\n\n"
+        fi
+    fi
+
+    if [[ -n ${error} ]]
+    then
+        mg2_error "$error"
+    fi
+
+    return 1
+}
+
+mg2_push_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Push local file or directory from Magento src root to php docker container.
+  To push multiple files or directories, specify paths as list divided by
+  spaces. To push all files, use --all flag. e.g. \`mg2 push -all\`.
+  Specified paths must be relative to Magento src root directory.
+
+\033[1;33mUsage:\033[0m
+  mg2 push [<path1> [<path2>...]] [flags...]
+
+\033[1;33mFlags:\033[0m
+  --all     Push all files from Magento src root to php docker container.
+  --help    Display this information.
+"
+    exit 0
+}
+
+mg2_push() {
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+        mg2_help
+    fi
+
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_push_help
+
+        if mg2_in_array "--all" $@
+        then
+            mg2_push_exec
+        else
+            while (("$#")); do
+                case "$1" in
+                    *)
+                        mg2_push_exec "$1"
+                    ;;
+                esac
+                shift
+            done
+        fi
+    else
+        mg2_push_help
+    fi
+}
+
+mg2_pwa_init() {
+    mg2_ask_bool "\nPWA Studio requires git cli, nodejs, yarn, and node-gyp. Required tools are installed?"
+
+    if [[ -z ${mg2_res} ]]
+    then
+        mg2_msg "Install the required tools before proceeding.\n"
+        exit 0
+    fi
+
+    if [[ -d "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio" ]]
+    then
+        mg2_error "Directory \`pwa-studio\` exists, PWA Studio is already installed?\nTo reinstall, remove \`pwa-studio\` directory with all its contents and run this command again.\n"
+        exit 1
+    fi
+
+    mg2_info_bold "\n[Installing PWA Studio]\n\n"
+
+    mg2_dots "Getting PWA Studio sources"
+    mg2_loading
+    git clone https://github.com/magento-research/pwa-studio.git >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Installing required packages"
+    mg2_loading
+    (
+        cd "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio" && \
+        yarn install
+    ) >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Configuring backend url"
+    mg2_loading
+    sed -i -e "s?^.*MAGENTO_BACKEND_URL=.*\$?MAGENTO_BACKEND_URL=https://${MG2_CFG_DOMAIN_NAME}/?" \
+        "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio/packages/venia-concept/.env"
+    mg2_result $?
+
+    mg2_dots "Password required to generate SSL certificate for PWA secure domain"
+    mg2_loading
+    mg2_result 0
+    tput cnorm
+    while ! sudo -p "$(printf "\033[0mPassword:")$(printf "\033[1;31m%s" " ")" true
+    do
+        exit 1
+    done
+    tput civis
+    mg2_erase_prev_lines 1
+
+    mg2_dots "Generating SSL certificate for PWA secure domain"
+    mg2_loading
+    (
+        cd "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio" && \
+        yarn buildpack create-custom-origin packages/venia-concept
+    ) >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_dots "Generating build artifacts"
+    mg2_loading
+    (
+        cd "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio" && \
+        yarn run build
+    ) >"${mg2_log}" 2>&1
+    mg2_result $?
+
+    mg2_info_bold "\n[Installation finished]\n\n"
+
+    mg2_msg "PWA Studio and Venia Project successfully installed!\n"
+    mg2_msg "Run \`mg2 pwa start\` command to run the full PWA Studio developer experience, which includes Venia hot-reloading and concurrent Buildpack/Peregrine rebuilds.\n\n"
+
+    mg2_msg "PWA Studio project path: "
+    mg2_info "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio/\n\n"
+}
+
+mg2_pwa_exec() {
+    cd "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio"
+
+    if [[ "$@" == "start" ]]
+    then
+        yarn run watch:all
+    else
+        yarn run "$@"
+    fi
+}
+
+mg2_pwa_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  PWA Studio related commands and wrapper for \`yarn run\` command inside of
+  project directory.
+
+\033[1;33mUsage:\033[0m
+  mg2 pwa <command|script> [--help]
+
+\033[1;33mCommands:\033[0m
+  init      Install PWA Studio and Venia Project.
+  start     Run the full PWA Studio developer experience, which includes
+            Venia hot-reloading and concurrent Buildpack/Peregrine rebuilds.
+
+\033[1;33mScripts:\033[0m
+  Script commands from project's package.json, e.g. \`build:dev\` etc.
+
+\033[1;33mFlags:\033[0m
+  --help    Display this information.
+"
+    exit 0
+}
+
+mg2_pwa() {
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_pwa_help
+
+        case "$@" in
+            init)
+                mg2_pwa_init
+            ;;
+            *)
+                if [[ ! -d "${mg2_project_dir}${sub_dir:+/${sub_dir}}/pwa-studio" ]]
+                then
+                    mg2_error "Directory \`pwa-studio\` does not exist, PWA Studio not installed?\nTo install, run the \`mg2 pwa init\` command.\n"
+                    exit 1
+                fi
+
+                mg2_pwa_exec "$@"
+            ;;
+        esac
+    else
+        mg2_pwa_help
+    fi
+}
+
+mg2_redis_configure() {
+    (
+        mg2_magento --notty setup:config:set --no-interaction --cache-backend=redis \
+                --cache-backend-redis-server=redis.${MG2_CFG_DOMAIN_NAME} --cache-backend-redis-db=0 && \
+        mg2_magento --notty setup:config:set --no-interaction  --page-cache=redis \
+                --page-cache-redis-server=redis.${MG2_CFG_DOMAIN_NAME} --page-cache-redis-db=1 && \
+        mg2_magento --notty setup:config:set --no-interaction --session-save=redis \
+                --session-save-redis-host=redis.${MG2_CFG_DOMAIN_NAME} --session-save-redis-log-level=4 \
+                --session-save-redis-db=2
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_domain_name() {
+    mg2_dots "Configuring the project domain name"
+    mg2_loading
+    mg2_magento --notty config:set web/secure/base_url "https://$MG2_CFG_DOMAIN_NAME/" >"${mg2_log}" 2>&1 && \
+    mg2_magento --notty config:set web/unsecure/base_url "https://$MG2_CFG_DOMAIN_NAME/" >"${mg2_log}" 2>&1
+    mg2_result $?
+}
+
+mg2_share() {
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_share_help
+
+        case "$@" in
+            us|eu|ap|au|sa|jp|in)
+                mg2_share_exec $1
+            ;;
+            *)
+                mg2_share_error
+            ;;
+        esac
+    else
+        mg2_share_exec us
+    fi
+}
+
+mg2_share_error() {
+    mg2_error "Unknown argument \`$@\`. Run \`mg2 share --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_share_exec() {
+    local region="$1"
+          network="${MG2_CFG_DOMAIN_NAME/.test/}_default" \
+          container="${MG2_CFG_DOMAIN_NAME}__$([[ -n ${MG2_CFG_VARNISH} ]] && echo "varnish" || echo "nginx")" \
+          port="$([[ -n ${MG2_CFG_VARNISH} ]] && echo "80" || echo "8080")"
+
+    mg2_info_bold "\n[Share]\n\n"
+
+    mg2_dots "Checking required dependencies"
+    mg2_loading
+    mg2_res="$(mg2_magento --notty module:status Shkoliar_Ngrok)"
+    mg2_result 0
+
+    if [[ "$mg2_res" != *"Module is enabled"* ]]
+    then
+        mg2_dots "Installing required dependencies"
+        mg2_loading
+        mg2_composer --notty require --dev shkoliar/magento-ngrok >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty module:enable Shkoliar_Ngrok >"${mg2_log}" 2>&1 && \
+        mg2_magento --notty setup:upgrade --no-interaction >"${mg2_log}" 2>&1
+        mg2_res=$?
+        mg2_result ${mg2_res}
+    else
+        mg2_res=0
+    fi
+
+    if [[ "$mg2_res" == "0" ]]
+    then
+        mg2_dots "Starting sharing session"
+        mg2_loading
+        docker pull shkoliar/ngrok >"${mg2_log}" 2>&1
+        mg2_result ${mg2_res}
+
+        docker run --rm -it -p 0.0.0.0:4551:4551/tcp --link ${container} --net ${network} \
+                --name ${MG2_CFG_DOMAIN_NAME}__ngrok shkoliar/ngrok ngrok http -region=${region} \
+                -bind-tls=true ${container}:${port} 2>"${mg2_log}"
+        mg2_res=$?
+
+        if [[ "$mg2_res" == "0" ]]
+        then
+            mg2_dots "Sharing session ended"
+            mg2_result 0
+        elif [[ -f "${mg2_log}" ]]
+        then
+            error="$(<"${mg2_log}")"
+            [[ -n ${error} ]] && mg2_error "$error\n"
+        fi
+    fi
+
+    exit ${mg2_res}
+}
+
+mg2_share_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Starts sharing session over ngrok secure tunnels. Command accepts an optional
+  parameter to specify the region. Ex. \`mg2 share eu\`. Available regions are
+  \`us\`, \`eu\`, \`ap\`, \`au\`, \`sa\`, \`jp\`, and \`in\`. By default region is \`us\`.
+  For proper functioning of this command, required dependencies will be
+  installed. Please, visit https://github.com/shkoliar/magento-ngrok and
+  https://github.com/shkoliar/docker-ngrok for more information.
+
+\033[1;33mUsage:\033[0m
+  mg2 share [region] [--help]
+
+\033[1;33mRegions:\033[0m
+  us        United States.
+  eu        Europe.
+  ap        Asia/Pacific.
+  au        Australia.
+  sa        South America.
+  jp        Japan.
+  in        India.
+
+\033[1;33mFlags:\033[0m
+  --help    Display this information.
+"
+    exit 0
+}
+
+mg2_sign() {
+    local mg2_ssl_dir="${mg2_global_dir}/ssl"
+    local mg2_domains=($@)
+    local mg2_alt_names=
+    local mg2_dns_index=$(echo "$(<"$mg2_ssl_dir"/config/v3_ext.conf)" | grep 'DNS.*' | awk 'END { print NR }')
+    local mg2_dns_index=${mg2_dns_index:-0}
+
+    if [[ "$mg2_dns_index" == "0" ]]
+    then
+        mg2_log="${mg2_global_dir}/log"
+    fi
+
+    for i in "${!mg2_domains[@]}"
+    do
+        if [[ "${mg2_domains[$i]}" != "mg2.test" ]] && ! mg2_validate_domain "${mg2_domains[$i]}"
+        then
+            mg2_error "Invalid domain name: \`${mg2_domains[$i]}\`!\nOnly valid domain names with \`.test\` tld are supported!\n"
+            exit 1
+        fi
+    done
+
+    for i in "${!mg2_domains[@]}"
+    do
+        if grep -q "*.${mg2_domains[$i]}" "$mg2_ssl_dir"/config/v3_ext.conf
+        then
+            continue
+        fi
+
+        mg2_dns_index=$((mg2_dns_index + 1))
+        mg2_alt_names+="
+        DNS.$((mg2_dns_index)) = ${mg2_domains[$i]}"
+        mg2_dns_index=$((mg2_dns_index + 1))
+        mg2_alt_names+="
+        DNS.$((mg2_dns_index)) = *.${mg2_domains[$i]}"
+    done
+
+    mg2_info_bold "\n[Installing SSL certificate]\n\n"
+
+    if [[ -z ${mg2_alt_names} ]]
+    then
+        mg2_dots "Signing SSL certificate"
+        mg2_loading
+        mg2_result 0
+    else
+        echo "$(<"${mg2_ssl_dir}/config/v3_ext.conf")${mg2_alt_names}" > "${mg2_ssl_dir}/config/v3_ext.conf"
+
+        mg2_dots "Generating private key for SSL certificate"
+        mg2_loading
+        [[ -f "${mg2_ssl_dir}/private/mg2.key" ]] && rm -rf "${mg2_ssl_dir}/private/mg2.key"
+        openssl genrsa -out "${mg2_ssl_dir}/private/mg2.key" 2048 >"${mg2_log}" 2>&1
+        mg2_result $?
+
+        mg2_dots "Creating signing request for SSL certificate"
+        mg2_loading
+        openssl req -new -sha256 \
+            -key "${mg2_ssl_dir}/private/mg2.key" \
+            -out "${mg2_ssl_dir}/certs/mg2.csr" \
+            -config "${mg2_ssl_dir}/config/openssl.conf" \
+            -subj "/O=mg121ecommerce/OU=IT/CN=${mg2_domains[0]}" >"${mg2_log}" 2>&1
+        mg2_result $?
+
+        pass="mg20"
+
+        mg2_dots "Signing SSL certificate"
+        mg2_loading
+        openssl x509 -req -days 825 -sha256 -extensions v3_req \
+            -CA "${mg2_ssl_dir}/certs/rootCA.crt" \
+            -CAkey "${mg2_ssl_dir}/private/rootCA.key" \
+            -CAcreateserial -passin pass:${pass} \
+            -in "${mg2_ssl_dir}/certs/mg2.csr" \
+            -out "${mg2_ssl_dir}/certs/mg2.crt" \
+            -extfile "${mg2_ssl_dir}/config/v3_ext.conf" >"${mg2_log}" 2>&1
+        mg2_result $?
+
+        if [[ -n "$(docker ps \
+                        --filter "label=com.docker.compose.project=mg2" \
+                        --filter "label=com.docker.compose.service=traefik" \
+                        -q)" ]]
+        then
+            mg2_global_restart traefik
+        fi
+    fi
+}
+
+mg2_sync() {
+    if [[ "$mg2_os" != "darwin" ]]
+    then
+        mg2_error "Unknown argument \`sync\`. Run \`mg2 --help\` for usage information.\n"
+        exit 1
+    fi
+
+    local mg2_sync_sessions=("src" "vendor")
+    local mg2_sync_command=
+
+    if (("$#"))
+    then
+        mg2_in_array "--help" $@ && mg2_sync_help
+
+        while (("$#")); do
+            case "$1" in
+                start)
+                    mg2_sync_command="$1"
+                    shift
+                    mg2_sync_exec start
+                ;;
+                stop)
+                    mg2_sync_command="$1"
+                    shift
+                    mg2_sync_exec terminate
+                ;;
+                pause)
+                    mg2_sync_command="$1"
+                    shift
+                    mg2_sync_exec pause
+                ;;
+                resume)
+                    mg2_sync_command="$1"
+                    shift
+                    mg2_sync_exec resume
+                ;;
+                flush)
+                    mg2_sync_command="$1"
+                    shift
+
+                    if [[ -n $1 ]]
+                    then
+                        if mg2_in_array "$1" ${mg2_sync_sessions[@]}
+                        then
+                            mg2_sync_exec flush $1
+                            shift
+                        else
+                            mg2_sync_exec flush
+                        fi
+                    else
+                        mg2_sync_error "$1"
+                    fi
+                ;;
+                status)
+                    mg2_sync_command="$1"
+                    shift
+                    mg2_sync_exec list | awk '{if(NR>5)print}'
+                ;;
+                *)
+                    mg2_sync_error "$1"
+                ;;
+            esac
+        done
+    else
+        mg2_sync_help
+    fi
+}
+
+mg2_sync_error() {
+    mg2_error "Unknown argument \`$1\`. Run \`mg2 sync --help\` for usage information.\n"
+    exit 1
+}
+
+mg2_sync_exec() {
+    local mg2_project_yml="${mg2_project_dir}/.mg2/mutagen/mutagen.yml"
+    mg2_sync_yml_expand #TODO: check new mutagen versions, temporary fix for https://github.com/mutagen-io/mutagen/issues/128
+    mg2_mutagen project $@ "${mg2_project_yml}"
+    mg2_sync_yml_restore #TODO: check new mutagen versions, temporary fix for https://github.com/mutagen-io/mutagen/issues/128
+}
+
+mg2_sync_yml_expand() {
+    local mg2_project_yml="${mg2_project_dir}/.mg2/mutagen/mutagen.yml"
+    yes | cp -rf "${mg2_project_yml}" "${mg2_project_yml}.bak"
+    (
+        IFS=
+        echo -e "cat <<MUTAGEN_YML\n$(< "${mg2_project_yml}.bak")\nMUTAGEN_YML" | bash > "${mg2_project_yml}"
+    )
+}
+
+mg2_sync_yml_restore() {
+    local mg2_project_yml="${mg2_project_dir}/.mg2/mutagen/mutagen.yml"
+    yes | cp -rf "${mg2_project_yml}.bak" "${mg2_project_yml}"
+    rm "${mg2_project_yml}.bak"
+}
+
+mg2_sync_help() {
+    echo -e "
+\033[1;33mInformation:\033[0m
+  Controls the synchronization sessions between host and docker container.
+
+\033[1;33mUsage:\033[0m
+  mg2 sync [command] [--help]
+
+\033[1;33mCommands:\033[0m
+  start     Start sync sessions.
+  stop      Stop sync sessions.
+  pause     Pause sync sessions.
+  resume    Resume paused sync sessions.
+  flush     Flush sync sessions.
+  status    Print sync sessions status.
+
+\033[1;33mFlags:\033[0m
+  --help    Display this information.
+"
+    exit 0
+}
+
+mg2_varnish() {
+    if [[ -z "$@" ]]; then
+        mg2_error "Please specify a varnish command. e.g. varnishstat.\n"
+        return 1
+    fi
+
+    docker-compose exec varnish "$@"
+}
+
+mg2_varnish_configure() {
+    local version=${MG2_CFG_VARNISH:0:1} \
+          dir="${mg2_project_dir}${MG2_CFG_MAGENTO_SRC:+/${MG2_CFG_MAGENTO_SRC}}"
+
+    [[ "$version" == "6" ]] && version=5
+
+    (
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/caching_application 2 && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/access_list nginx.${MG2_CFG_DOMAIN_NAME} && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/backend_host nginx.${MG2_CFG_DOMAIN_NAME} && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/backend_port 8080 && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/grace_period 300 && \
+        mg2_magento --notty setup:config:set --http-cache-hosts=varnish.${MG2_CFG_DOMAIN_NAME}:80 && \
+        mg2_magento --notty varnish:vcl:generate --access-list nginx.${MG2_CFG_DOMAIN_NAME} \
+            --backend-host nginx.${MG2_CFG_DOMAIN_NAME} \
+            --backend-port 8080 --export-version ${version} \
+            --output-file ./var/default.vcl
+    ) >"${mg2_log}" 2>&1 && \
+    (
+        mg2_pull var/default.vcl >/dev/null 2>&1 && \
+        sed -e 's/pub\/health_check.php/health_check.php/g' "${dir}/var/default.vcl" > "${dir}/var/default.temp" && \
+        mv "${dir}/var/default.temp" "${dir}/var/default.vcl" && \
+        docker cp "${dir}/var/default.vcl" "${MG2_CFG_DOMAIN_NAME}__varnish:/usr/local/share/"
+    ) >"${mg2_log}" 2>&1 && \
+    (
+        mg2_varnish varnishadm vcl.load default /usr/local/share/default.vcl && \
+        mg2_varnish varnishadm vcl.use default
+    ) >"${mg2_log}" 2>&1 && \
+    (
+        rm -rf "${dir}/var/default.vcl" && \
+        mg2_cli --notty rm -rf ./var/default.vcl
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_varnish_reset() {
+    (
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/caching_application 1 && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/access_list "" && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/backend_host "" && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/backend_port "" && \
+        mg2_magento --notty config:set --scope=default --scope-code=0 \
+            system/full_page_cache/varnish/grace_period ""
+    ) >"${mg2_log}" 2>&1
+
+    return $?
+}
+
+mg2_docker_cp() {
+    local source="$1" destination="$2"
+    [[ "$mg2_os" == "darwin" ]] && docker cp "${source}" "${destination}" || true
+}

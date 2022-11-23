@@ -1,0 +1,3 @@
+#!/bin/bash
+
+curl -sL -o install.run raw.githubusercontent.com/cmarin121/magento2-docker/master/install && chmod 755 install.run && ./install.run </dev/tty

@@ -1,0 +1,23 @@
+version: "3.5"
+
+services:
+
+  nginx:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__nginx
+    image: zerocool78/mg2:nginx-${MG2_CFG_NGINX:-1.17}-alpine
+    depends_on:
+      - db
+      - php
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.nginx-${COMPOSE_PROJECT_NAME}.tls=true
+      - traefik.http.routers.nginx-${COMPOSE_PROJECT_NAME}.entryPoints=https
+      - traefik.http.routers.nginx-${COMPOSE_PROJECT_NAME}.rule=Host(${MG2_CFG_DOMAIN_NAMES})
+      - traefik.http.services.nginx-${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=8080
+    networks:
+      default:
+        aliases:
+          - nginx.${MG2_CFG_DOMAIN_NAME}
+      mg2:
+        aliases:
+          - nginx.${MG2_CFG_DOMAIN_NAME}

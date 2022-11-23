@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+VERSIONS=("5.6" "7.0" "7.1" "7.2" "7.3" "7.4")
+
+while (("$#")); do
+    case "$1" in
+        --version|--version=*)
+            if [[ "$1" == "--version" ]]
+            then
+                shift
+                VERSION="$1"
+            else
+                VERSION="${version#*=}"
+            fi
+        ;;
+        --xdebug)
+            XDEBUG=1
+        ;;
+        --alpine)
+            ALPINE=1
+        ;;
+    esac
+    shift
+done
+
+VERSION=${VERSION:-7.3}
+XDEBUG=${XDEBUG:-}
+ALPINE=${ALPINE:-}
+
+HOME="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+if [[ -z ${ALPINE} ]]
+then
+    if [[ -z ${XDEBUG} ]]
+    then
+        docker build -f "${HOME}/$VERSION/fpm/debian/Dockerfile" \
+            -t "zerocool78/mg2:php-fpm-$VERSION" \
+            "${HOME}/$VERSION/fpm/debian"
+
+        echo
+        echo "docker push \"zerocool78/mg2:php-fpm-$VERSION\""
+        echo "docker rmi -f \"zerocool78/mg2:php-fpm-$VERSION\""
+    else
+        docker build -f "${HOME}/$VERSION/fpm-xdebug/debian/Dockerfile" \
+            -t "zerocool78/mg2:php-fpm-$VERSION-xdebug" \
+            "${HOME}/$VERSION/fpm-xdebug/debian"
+
+        echo
+        echo "docker push \"zerocool78/mg2:php-fpm-$VERSION-xdebug\""
+        echo "docker rmi -f \"zerocool78/mg2:php-fpm-$VERSION-xdebug\""
+    fi
+else
+    if [[ -z ${XDEBUG} ]]
+    then
+        docker build -f "${HOME}/$VERSION/fpm/alpine/Dockerfile" \
+            -t "zerocool78/mg2:php-fpm-$VERSION-alpine" \
+            "${HOME}/$VERSION/fpm/alpine"
+
+        echo
+        echo "docker push \"zerocool78/mg2:php-fpm-$VERSION-alpine\""
+        echo "docker rmi -f \"zerocool78/mg2:php-fpm-$VERSION-alpine\""
+    else
+        docker build -f "${HOME}/$VERSION/fpm-xdebug/alpine/Dockerfile" \
+            -t "zerocool78/mg2:php-fpm-$VERSION-xdebug-alpine" \
+            "${HOME}/$VERSION/fpm-xdebug/alpine"
+
+        echo
+        echo "docker push \"zerocool78/mg2:php-fpm-$VERSION-xdebug-alpine\""
+        echo "docker rmi -f \"zerocool78/mg2:php-fpm-$VERSION-xdebug-alpine\""
+    fi
+fi
+
+rm -rf "${HOME}/.docker"

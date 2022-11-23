@@ -1,0 +1,26 @@
+version: "3.5"
+
+services:
+
+  elasticsearch:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__elasticsearch
+    image: zerocool78/mg2:elasticsearch-${MG2_CFG_ELASTICSEARCH:-6.8}-alpine
+    user: root
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.elasticsearch-${COMPOSE_PROJECT_NAME}.tls=true
+      - traefik.http.routers.elasticsearch-${COMPOSE_PROJECT_NAME}.entryPoints=https
+      - traefik.http.routers.elasticsearch-${COMPOSE_PROJECT_NAME}.rule=Host(`elasticsearch.${MG2_CFG_DOMAIN_NAME}`)
+      - traefik.http.services.elasticsearch-${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=9200
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      default:
+        aliases:
+          - elasticsearch.${MG2_CFG_DOMAIN_NAME}
+      mg2:
+        aliases:
+          - elasticsearch.${MG2_CFG_DOMAIN_NAME}
+
+volumes:
+  elasticsearch_data:

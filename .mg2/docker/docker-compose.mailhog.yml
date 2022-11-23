@@ -1,0 +1,14 @@
+version: "3.5"
+
+services:
+
+  mailhog:
+    container_name: mg2.test__mailhog
+    image: mailhog/mailhog:${MG2_GLOBAL_MAILHOG}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mailhog-mg2.tls=true
+      - traefik.http.routers.mailhog-mg2.entryPoints=https
+      - traefik.http.routers.mailhog-mg2.rule=Host(`mailhog.mg2.test`)
+      - traefik.http.services.mailhog-mg2.loadbalancer.server.port=8025
+    restart: ${MG2_GLOBAL_SERVICES_AUTO_START}

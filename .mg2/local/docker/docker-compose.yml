@@ -1,0 +1,69 @@
+version: "3.5"
+
+services:
+
+  php:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__php
+    image: zerocool78/mg2:php-fpm-${MG2_CFG_PHP:-7.3}
+    extra_hosts:
+      - ${MG2_CFG_DOMAIN_NAME}:${MG2_TRAEFIK_IP:-0.0.0.0}
+    depends_on:
+      - db
+    labels:
+      - mg2.project.path=${MG2_CFG_PROJECT_PATH}
+    networks:
+      - default
+      - mg2
+
+  xdebug:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__xdebug
+    image: zerocool78/mg2:php-fpm-${MG2_CFG_PHP:-7.3}-xdebug
+    extra_hosts:
+      - ${MG2_CFG_DOMAIN_NAME}:${MG2_TRAEFIK_IP:-0.0.0.0}
+    environment:
+      - PHP_IDE_CONFIG=serverName=${MG2_CFG_DOMAIN_NAME}
+    depends_on:
+      - db
+    networks:
+      - default
+      - mg2
+
+  db:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__db
+    image: mariadb:${MG2_CFG_MARIADB:-10.3}
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MG2_CFG_MYSQL_ROOT_PASSWORD:-magento}
+      - MYSQL_DATABASE=${MG2_CFG_MYSQL_DATABASE:-magento}
+      - MYSQL_USER=${MG2_CFG_MYSQL_USER:-magento}
+      - MYSQL_PASSWORD=${MG2_CFG_MYSQL_PASSWORD:-magento}
+    volumes:
+      - ./../mysql/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
+      - db_data:/var/lib/mysql
+    networks:
+      default:
+        aliases:
+          - db.${MG2_CFG_DOMAIN_NAME}
+      mg2:
+        aliases:
+          - db.${MG2_CFG_DOMAIN_NAME}
+
+  redis:
+    container_name: ${MG2_CFG_DOMAIN_NAME}__redis
+    image: redis:${MG2_CFG_REDIS:-5.0}-alpine
+    volumes:
+      - redis_data:/data
+    networks:
+      default:
+        aliases:
+          - redis.${MG2_CFG_DOMAIN_NAME}
+      mg2:
+        aliases:
+          - redis.${MG2_CFG_DOMAIN_NAME}
+
+volumes:
+  db_data:
+  redis_data:
+
+networks:
+  mg2:
+    external: true

@@ -1,0 +1,15 @@
+[api]
+  dashboard = true
+
+[entryPoints]
+  [entryPoints.http]
+    address = ":80"
+  [entryPoints.https]
+    address = ":443"
+
+[providers]
+  [providers.docker]
+    exposedByDefault = false
+    network = "mg2"
+  [providers.file]
+    filename = "/etc/traefik/dynamic.toml"
